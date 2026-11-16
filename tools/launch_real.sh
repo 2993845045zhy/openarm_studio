@@ -1,22 +1,34 @@
 #!/usr/bin/env bash
-# 启动 OpenArm 规划栈（bringup + move_group），**不弹 RViz**。
+# 起 OpenArm 规划栈 —— 全部用官方 launch，不自造：
+#   1) openarm_bringup/openarm.bimanual.launch.py   （robot + controllers，launch_rviz 可关）
+#   2) openarm_bimanual_moveit_config/move_group.launch.py（只起 move_group）
 #
 #   bash launch_real.sh          # 假硬件（默认，不碰电机）
-#   bash launch_real.sh --real   # 真硬件（驱动电机，注意安全）
+#   bash launch_real.sh --real   # 真硬件
 set -e
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 # shellcheck disable=SC1091
 source /opt/ros/jazzy/setup.bash
 # shellcheck disable=SC1091
 source "$HOME/openarm_ws/install/setup.bash"
-cd "$HOME/openarm_studio"
 
-export PYTHONPATH="$PWD:$PYTHONPATH"
-export OPENARM_FAKE=1
+FAKE=true
 for arg in "$@"; do
-  [ "$arg" = "--real" ] && OPENARM_FAKE=0
+  [ "$arg" = "--real" ] && FAKE=false
 done
-export OPENARM_RIGHT_CAN=can0
-export OPENARM_LEFT_CAN=can1
 
-exec ros2 launch openarm_studio/launch/studio_stack.launch.py
+# 1) 官方 bringup（不弹 RViz）
+ros2 launch openarm_bringup openarm.bimanual.launch.py \
+  arm_type:=v10 \
+  use_fake_hardware:="$FAKE" \
+  robot_controller:=joint_trajectory_controller \
+  launch_rviz:=false &
+BRINGUP=$!
+
+# 2) 官方 move_group（等控制器加载完再起，避免抢不到 action）
+sleep 8
+ros2 launch openarm_bimanual_moveit_config move_group.launch.py &
+MOVEIT=$!
+
+trap 'kill -INT $MOVEIT $BRINGUP 2>/dev/null || true' INT TERM
+wait
