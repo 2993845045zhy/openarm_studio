@@ -49,27 +49,37 @@ class ControlClient:
         self._lock = threading.Lock()
 
     # ── 查询 ─────────────────────────────────────────
-    def managers_ready(self) -> bool:
-        return self._sw.service_is_ready() and self._list.service_is_ready()
+    def list_controllers(self, timeout: float = 1.0) -> list[tuple[str, str, str]]:
+        """返回 [(name, type, state)]。
 
-    def list_controllers(self, timeout: float = 0.6) -> list[tuple[str, str, str]]:
-        """返回 [(name, type, state)]，失败返回空表。"""
-        if not self._list.service_is_ready():
+        不用 service_is_ready() 做门禁：实测服务已在图上、该方法仍返回
+        False（图缓存不刷新），gate 住就永远"连不上"。直接发请求、
+        按截止时间等结果，失败就当没就绪。
+        """
+        req = ListControllers.Request()
+        try:
+            fut = self._list.call_async(req)
+        except Exception:  # noqa: BLE001
             return []
-        fut = self._list.call_async(ListControllers.Request())
-        t0 = threading.Event()
-        fut.add_done_callback(lambda _f: t0.set())
-        t0.wait(timeout)
-        if not fut.done() or fut.result() is None:
+        done = threading.Event()
+        fut.add_done_callback(lambda _f: done.set())
+        if not done.wait(timeout):
             return []
-        return [(c.name, c.type, c.state) for c in fut.result().controller]
+        try:
+            res = fut.result()
+        except Exception:  # noqa: BLE001
+            return []
+        if res is None:
+            return []
+        return [(c.name, c.type, c.state) for c in res.controller]
+
+    def managers_ready(self) -> bool:
+        """能用 = 真能拿到控制器列表（含服务刚起来、还没 spawn 完的情况）。"""
+        return bool(self.list_controllers(1.0))
 
     # ── 控制器切换 ───────────────────────────────────
     def switch(self, start: list[str], stop: list[str],
                strict: bool = False, timeout: float = 2.0) -> bool:
-        if not self._sw.service_is_ready():
-            self._log("controller_manager 不可用（真机栈未启动？）")
-            return False
         req = SwitchController.Request()
         req.start_controllers = start
         req.stop_controllers = stop

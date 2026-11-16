@@ -78,14 +78,15 @@ class StackManager:
         if not os.path.exists(LAUNCH_SCRIPT):
             self._log(f"缺少启动脚本 {LAUNCH_SCRIPT}")
             return False
+        # launch_real.sh 默认假硬件，真机必须显式 --real（否则真机模式会起假硬件）
         if fake:
             self._proc = subprocess.Popen(
-                ["bash", LAUNCH_SCRIPT, "--fake"],
+                ["bash", LAUNCH_SCRIPT],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True, shell=False)
         else:
             self._proc = subprocess.Popen(
-                ["bash", LAUNCH_SCRIPT],
+                ["bash", LAUNCH_SCRIPT, "--real"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 start_new_session=True, shell=False)
         self._log(f"已启动真机栈（pid {self._proc.pid}），等待 controller_manager…")
