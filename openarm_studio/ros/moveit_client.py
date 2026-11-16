@@ -89,36 +89,41 @@ class MoveItClient:
                vel_scale: float = 0.1, acc_scale: float = 0.1,
                plan_only: bool = False) -> MoveGroup.Goal:
         req = MoveGroup.Goal()
+        # planning_options 属于 Goal（不是 MotionPlanRequest）
+        req.planning_options.plan_only = bool(plan_only)
+        req.planning_options.replan = False
+        req.planning_options.look_around = False
+        req.planning_options.planning_scene_diff.is_diff = True
+
         r = req.request
         r.group_name = group
         r.num_planning_attempts = 10
         r.allowed_planning_time = 5.0
         r.max_velocity_scaling_factor = float(vel_scale)
         r.max_acceleration_scaling_factor = float(acc_scale)
-        r.planning_options.plan_only = bool(plan_only)
-        r.planning_options.replan = False
-        r.planning_options.look_around = False
-        r.planning_options.planning_scene_diff.is_diff = True
 
-        c = r.goal_constraints.add()
+        from moveit_msgs.msg import Constraints, JointConstraint, \
+            OrientationConstraint, PositionConstraint
+
+        c = Constraints()
         c.name = f"{group}_goal"
         if joint_goal is not None:
             for name, val in zip(GROUP_JOINTS[group], joint_goal):
-                jc = c.joint_constraints.add()
+                jc = JointConstraint()
                 jc.joint_name = name
                 jc.position = float(val)
                 jc.tolerance_above = 0.01
                 jc.tolerance_below = 0.01
                 jc.weight = 1.0
+                c.joint_constraints.append(jc)
         elif pose_goal is not None:
-            pc = c.position_constraints.add()
+            pc = PositionConstraint()
             pc.header.frame_id = pose_reference or "world"
             pc.link_name = self._ee_link(group)
             pc.constraint_region.primitive_poses.append(pose_goal)
-            pc.constraint_region.primitive_poses[0].position = pose_goal.position
-            pc.constraint_region.primitive_poses[0].orientation = pose_goal.orientation
             pc.weight = 1.0
-            oc = c.orientation_constraints.add()
+            c.position_constraints.append(pc)
+            oc = OrientationConstraint()
             oc.header.frame_id = pc.header.frame_id
             oc.link_name = pc.link_name
             oc.orientation = pose_goal.orientation
@@ -126,6 +131,8 @@ class MoveItClient:
             oc.absolute_y_axis_tolerance = 0.05
             oc.absolute_z_axis_tolerance = 0.05
             oc.weight = 1.0
+            c.orientation_constraints.append(oc)
+        r.goal_constraints.append(c)
         return req
 
     @staticmethod
@@ -150,11 +157,13 @@ class MoveItClient:
             done_cb(False, "move_group 未启动")
             return False
 
+        plan_only = bool(goal.planning_options.plan_only)
         fut = self._client.send_goal_async(goal)
-        fut.add_done_callback(lambda f: self._on_goal(f, goal, done_cb))
+        fut.add_done_callback(
+            lambda f: self._on_goal(f, plan_only, done_cb))
         return True
 
-    def _on_goal(self, fut, goal, done_cb) -> None:
+    def _on_goal(self, fut, plan_only: bool, done_cb) -> None:
         gh = fut.result()
         if gh is None or not gh.accepted:
             with self._lock:
@@ -162,9 +171,9 @@ class MoveItClient:
             done_cb(False, "目标被拒绝")
             return
         gh.get_result_async().add_done_callback(
-            lambda f: self._on_result(f, goal, done_cb))
+            lambda f: self._on_result(f, plan_only, done_cb))
 
-    def _on_result(self, fut, goal, done_cb) -> None:
+    def _on_result(self, fut, plan_only: bool, done_cb) -> None:
         with self._lock:
             self._busy = False
         res = fut.result()
@@ -181,7 +190,7 @@ class MoveItClient:
                 pts = r.planned_trajectory.joint_trajectory.points[-1]
                 dur = pts.time_from_start.sec + pts.time_from_start.nanosec / 1e9
             txt = (f"规划成功：{n} 个轨迹点，时长 {dur:.2f}s"
-                   if goal.request.planning_options.plan_only
+                   if plan_only
                    else f"执行完成（{n} 个轨迹点）")
         else:
             txt = f"失败（status={code}）{r.error_code.message if hasattr(r, 'error_code') else ''}"

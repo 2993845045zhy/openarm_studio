@@ -695,7 +695,8 @@ class StudioWindow(QMainWindow):
         row.addWidget(self.btn_plan, 1)
         row.addWidget(self.btn_exec, 1)
         card3.add(holder)
-        self.lbl_plan = QLabel("MoveIt 未就绪（需先启动真机栈）", card3)
+        self.lbl_plan = QLabel("点「启动」后即可规划：仿真模式走假硬件"
+                               "（不需要真电机），真机模式才驱动电机", card3)
         self.lbl_plan.setObjectName("hintText")
         self.lbl_plan.setWordWrap(True)
         card3.add(self.lbl_plan)
@@ -1104,13 +1105,21 @@ class StudioWindow(QMainWindow):
         self.btn_gear.clicked.connect(lambda: self._goto_page(1))
 
     def _on_start(self) -> None:
-        self._log("启动真机栈…")
+        """启动规划栈。
+
+        两种都不需要真电机：
+        - 仿真模式 → 假硬件（mock_components），MoveIt 规划+执行全可用，
+          执行是"指令直接到位"，孪生跟着走
+        - 真机模式 → 真硬件，需要 CAN 与电机
+        """
         fake = self._is_sim
+        self._log("启动仿真栈（假硬件，无需真机）…" if fake
+                  else "启动真机栈（将驱动真实电机）…")
         ok = self._stack.start(fake=fake)
-        if ok:
-            self.sum_rows["状态"].setText("启动中…")
-        else:
-            self.sum_rows["状态"].setText("启动失败")
+        self.sum_rows["状态"].setText("启动中…" if ok else "启动失败")
+        if ok and fake:
+            self._log("提示：假硬件模式下 MoveIt 可完整规划与执行，"
+                      "不碰电机；孪生仍显示 MuJoCo 视角")
 
     def _on_stop(self) -> None:
         self._log("停止真机栈…")
@@ -1194,7 +1203,14 @@ class StudioWindow(QMainWindow):
             self._log(f"启动前检查：最大关节偏差 {worst:.3f} rad —— 可以启动")
 
     def _publish_sim_state(self) -> None:
+        """仿真模式下由本应用发 /joint_states（冒充 broadcaster）。
+
+        但一旦真机栈（含假硬件）在跑，broadcaster 才是唯一合法发布者——
+        两边同时发会让 MoveIt/RViz 收到互相打架的状态，所以此时让位。
+        """
         if not self._is_sim or self.js_pub is None or self._worker is None:
+            return
+        if self._stack.running:
             return
         pos = self._worker.positions()
         if pos:
@@ -1225,10 +1241,17 @@ class StudioWindow(QMainWindow):
             lbl.setText(f"{pose.get(name, 0.0):+.3f}")
 
         if sim:
-            self.status_dot.set_state(self._pal_now["accent"], "仿真运行中", breathe=True)
+            if self._stack.running:
+                self.status_dot.set_state(self._pal_now["accent"],
+                                          "仿真栈运行中", breathe=True)
+                self.row_link.set_value("MoveIt + 假硬件")
+                self.row_rate.set_value("mock 无电机")
+            else:
+                self.status_dot.set_state(self._pal_now["accent"],
+                                          "仿真（未启栈）", breathe=True)
+                self.row_link.set_value("MuJoCo 物理")
+                self.row_rate.set_value("1 kHz 物理")
             self.chip_src.setText("仿真")
-            self.row_link.set_value("MuJoCo 物理")
-            self.row_rate.set_value("1 kHz 物理")
         elif following:
             rate = self.bridge.rate if self.bridge else 0.0
             self.status_dot.set_state(self._pal_now["success"], "真机在线", breathe=False)
