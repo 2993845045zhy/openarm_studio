@@ -105,62 +105,36 @@ def generate_urdf(out_path: Path, *, bimanual: bool = True,
     return out_path
 
 
-def _mirror_shards(shards: list[Path], key: str) -> list[Path]:
-    """对分片做 Y 镜像（URDF 用负 scale 复用左右臂/手指网格）。
-
-    MjSpec 会把同文件 mesh 声明合并且丢掉负 scale——左右臂、两根
-    手指全部变成同一份未镜像几何、挤在同一侧。这里直接生成镜像版
-    STL（几何翻 Y + 面序反转），URDF 里的 scale 改写成全正。
-    """
-    import trimesh
-
-    outs = []
-    for src in shards:
-        dst = src.with_name(src.stem + "_m.stl")
-        if not dst.exists():
-            g = trimesh.load(str(src), force="mesh")
-            g.apply_transform(__import__("numpy").diag([1.0, -1.0, 1.0, 1.0]))
-            g.export(str(dst))
-        outs.append(dst)
-    return outs
-
-
 def _mesh_rewrite(text: str, desc_root: Path) -> str:
+    """只做路径改写与 dae→stl 转换，**scale 原样保留**。
+
+    MuJoCo 的 URDF 导入器本来就支持负 scale（官方 openarm_mujoco 的
+    mesh 声明里就是 scale="1 -1 1"）。早前以为它丢负号、生成镜像文件
+    去补，结果和 MuJoCo 自己的负 scale 叠加成双重镜像，左右手指又回到
+    同一侧——必须交回给 MuJoCo 处理。
+    """
     text = text.replace(f"package://{DESC_PACKAGE}/", f"{desc_root}/")
 
     def repl(m: re.Match[str]) -> str:
-        fname, scale = m.group(1), m.group(2)
-        negate = scale is not None and "-" in scale
-        suffix = '.stl' if fname.lower().endswith('.stl') else None
+        fname = m.group(1)
         src = Path(fname)
-        shards: list[Path] | None = None
+        out: Path | None = None
         if src.suffix.lower() == ".dae":
             try:
-                shards = _convert_dae(src)
+                out = _convert_dae(src)[0]
             except Exception:  # noqa: BLE001
-                shards = None
-        if shards is None:
-            # 非 dae（或转换失败）：同目录/碰撞目录的 stl
-            if src.suffix.lower() == ".stl" and src.exists():
-                shards = [src]
-            else:
-                for cand in (src.with_suffix(".stl"),
-                             Path(str(src).replace("/visual/", "/collision/")).with_suffix(".stl")):
-                    if cand.exists():
-                        shards = [cand]
-                        break
-        if shards is None:
+                out = None
+        if out is None:
+            for cand in (src.with_suffix(".stl"),
+                         Path(str(src).replace("/visual/", "/collision/")).with_suffix(".stl")):
+                if cand.exists():
+                    out = cand
+                    break
+        if out is None:
             return m.group(0)
-        if negate:
-            shards = _mirror_shards(shards, src.stem)
-        pos_scale = scale.replace("-", "") if scale else scale
-        out = f'filename="{shards[0]}"'
-        if pos_scale:
-            out += f' scale="{pos_scale}"'
-        return out
+        return m.group(0).replace(fname, str(out))
 
-    # filename 与 scale 成对处理（scale 可选）
-    return re.sub(r'filename="([^"]+)"(?:\s+scale="([^"]+)")?', repl, text)
+    return re.sub(r'filename="([^"]+)"', repl, text)
 
 
 COMPILER = (
@@ -281,7 +255,10 @@ def _expand_visual_shards(text: str) -> str:
         if not hit or hit.group("idx") != "0":
             return block
         prefix, key, mirror = hit.group("stem"), hit.group("hash"), hit.group("mirror") or ""
-        siblings = sorted(cache.glob(f"{prefix}_*_{key}*.stl"))
+        # 只展开**同一镜像态**的分片：_m 与非 _m 是同一部件的两种朝向，
+        # 混在一起展开会让一根手指拿到 4 份几何（正常 2 色 + 镜像 2 色），
+        # 鬼影伸出掌外
+        siblings = sorted(cache.glob(f"{prefix}_*_{key}{mirror}.stl"))
         if len(siblings) <= 1:
             return block
         extra = []
