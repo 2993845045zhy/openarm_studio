@@ -60,19 +60,20 @@ def _apply_finishes(xml: str) -> str:
         if key not in mat_names:
             r, g, b = (v / 255.0 for v in rgb)
             mean = (r + g + b) / 3.0
+            # dae 颜色 → 实物部件（用户逐件确认）：
+            #   251 银白 = 机加铝件；63 灰 = 电机外壳；24 深黑 = 打印塑料件
             if mean > 0.45:
                 # 银色机加件：金属高光，基色不变
                 spec, shin, metal, rough = 0.85, 0.6, 1.0, 0.35
                 lift = 1.0
             elif mean > 0.15:
-                # 3D 打印塑料件：半哑光。dae 基色(63)在 MuJoCo 光照下
-                # 输出太暗（用户两次反馈太黑），基色提亮保留层次
-                spec, shin, metal, rough = 0.35, 0.45, 0.0, 0.55
-                lift = 1.75
+                # 电机外壳（63）：近黑哑光，只提一点保证轮廓可辨
+                spec, shin, metal, rough = 0.15, 0.25, 0.0, 0.6
+                lift = 1.15
             else:
-                # 电机/深色件：硬质光泽，提亮幅度更大否则和阴影没区别
-                spec, shin, metal, rough = 0.30, 0.5, 0.1, 0.45
-                lift = 2.1
+                # 3D 打印塑料件（24/0）：黑色带塑料柔和高光，提亮到深灰黑
+                spec, shin, metal, rough = 0.35, 0.45, 0.0, 0.55
+                lift = 3.2
             r, g, b = (min(1.0, v * lift) for v in (r, g, b))
             if key not in seen_mats:
                 mats_xml.append(
