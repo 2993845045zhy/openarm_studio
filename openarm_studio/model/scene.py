@@ -25,6 +25,78 @@ ALL_ACTUATED = LEFT_ARM + LEFT_GRIP + RIGHT_ARM + RIGHT_GRIP
 GRIP_OPEN = 0.044   # m，完全张开
 GRIP_CLOSED = 0.0
 
+# 外观配色不再人工指定：dae 里自带每种部件的材质颜色（银色金属件 /
+# 3D 打印灰黑 / 电机黑），urdf2mjcf 转换时按颜色拆分并记录在
+# ~/.cache/openarm_studio/meshes/colors.json，_apply_finishes 还原。
+
+
+def _apply_finishes(xml: str) -> str:
+    """按 dae 提取的原始配色给 visual geom 绑材质；collision 挪到第 3 组。
+
+    颜色来自 urdf2mjcf 转换时写的 colors.json（分片名 → rgb）。
+    亮度高的（银色金属件）给金属质感，深色（打印件/电机）给哑光。
+    """
+    import json
+    import re as _re
+    from pathlib import Path as _P
+
+    meta_path = _P.home() / ".cache/openarm_studio/meshes/colors.json"
+    colors = {}
+    if meta_path.exists():
+        colors = {k: tuple(v) for k, v in json.loads(meta_path.read_text()).items()}
+
+    # mesh name → 分片名（MjSpec 导出的 mesh 名 = 文件 stem，colors.json
+    # 的键同样是无后缀 stem）
+    mesh_file = {}
+    for m in _re.finditer(r'<mesh\s+name="([^"]+)"[^>]*file="([^"]+)"', xml):
+        mesh_file[m.group(1)] = _P(m.group(2)).stem
+
+    mat_names = {}       # rgb -> 材质名
+    mats_xml = []
+    seen_mats = set()
+
+    def material_for(rgb: tuple) -> str:
+        key = f"mat_c{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
+        if key not in mat_names:
+            r, g, b = (v / 255.0 for v in rgb)
+            bright = (r + g + b) / 3.0 > 0.45
+            if bright:  # 银色金属件
+                spec, shin, metal, rough = 0.85, 0.6, 1.0, 0.35
+            else:       # 3D 打印 / 电机：哑光深色
+                spec, shin, metal, rough = 0.08, 0.1, 0.0, 0.9
+            if key not in seen_mats:
+                mats_xml.append(
+                    f'<material name="{key}" rgba="{r:.3f} {g:.3f} {b:.3f} 1" '
+                    f'specular="{spec}" shininess="{shin}" metallic="{metal}" '
+                    f'roughness="{rough}"/>')
+                seen_mats.add(key)
+            mat_names[rgb] = key
+        return mat_names[rgb]
+
+    def repl(m: _re.Match[str]) -> str:
+        tag = m.group(0)
+        name = m.group(1)
+        if name.endswith("_collision"):
+            if 'group="' in tag:
+                return tag
+            return tag[:-2] + ' group="3"/>'
+        mesh_m = _re.search(r'mesh="([^"]+)"', tag)
+        if mesh_m and (name.endswith("_visual") or "_visual_c" in name):
+            shard = mesh_file.get(mesh_m.group(1), "")
+            rgb = colors.get(shard)
+            if rgb is None:
+                return tag
+            mat = material_for(rgb)
+            if 'material="' in tag:
+                return tag
+            return tag[:-2] + f' material="{mat}"/>'
+        return tag
+
+    xml = _re.sub(r'<geom name="([^"]+)"[^>]*/>', repl, xml)
+    if mats_xml:
+        xml = _inject_into(xml, "asset", "".join(mats_xml))
+    return xml
+
 
 def _hex_to_rgb(h: str) -> list[float]:
     h = h.lstrip("#")
@@ -95,6 +167,11 @@ def build_spec(urdf_path: Path, *, sky_rgb: list[float], floor_rgb: list[float],
 
     s = max(0.4, float(light_scale))
     sky = " ".join(f"{v:.4f}" for v in sky_rgb)
+
+    def mat_xml(name: str, p: dict) -> str:
+        attrs = " ".join(f'{k}="{v}"' for k, v in p.items())
+        return f'<material name="{name}" {attrs}/>'
+
     assets = (
         '<texture name="grid" type="2d" file="%s"/>'
         # 内置 gradient 天空盒：两端同色＝纯色天空，且不依赖外部图片尺寸
@@ -127,8 +204,12 @@ def build_spec(urdf_path: Path, *, sky_rgb: list[float], floor_rgb: list[float],
 
     xml = _inject_into(xml, "asset", assets)
     xml = _inject_into(xml, "worldbody", scene)
+    xml = _apply_finishes(xml)
     # 位置伺服 actuator：仿真模式下由指令驱动关节，而不是直接改 qpos
     xml = _inject_into(xml, "actuator", _actuators())
+    # URDF 的 <mimic>（finger2 跟随 finger1）MuJoCo 导入时会丢弃，
+    # 用 joint equality 补回来，否则第二根手指永远不动
+    xml = _inject_into(xml, "equality", _equalities())
     # visual 块：有就合并，没有就插到 </mujoco> 前
     if "<visual>" in xml:
         xml = xml.replace("<visual>", "<visual>", 1)
@@ -155,6 +236,16 @@ def _actuators() -> str:
         out.append(f'<position name="{side}_grip_act" '
                    f'joint="openarm_{side}_finger_joint1" kp="60" '
                    f'dampratio="1" ctrllimited="true" ctrlrange="0 0.044"/>')
+    return "".join(out)
+
+
+def _equalities() -> str:
+    """两对手指的 mimic：finger2 = finger1（URDF <mimic> 的等价物）。"""
+    out = []
+    for side in ("left", "right"):
+        j1 = f"openarm_{side}_finger_joint1"
+        j2 = f"openarm_{side}_finger_joint2"
+        out.append(f'<joint joint1="{j1}" joint2="{j2}" polycoef="0 1 0 0 0"/>')
     return "".join(out)
 
 
@@ -210,7 +301,11 @@ def joint_qpos_map(model: mujoco.MjModel) -> dict[str, int]:
 
 def apply_joint_positions(model: mujoco.MjModel, data: mujoco.MjData,
                           positions: dict[str, float]) -> int:
-    """把 关节名→角度 写进 qpos（自动跳过不存在的关节），返回写入数。"""
+    """把 关节名→角度 写进 qpos（自动跳过不存在的关节），返回写入数。
+
+    finger_joint2 是 finger_joint1 的 mimic：equality 约束只在物理步进时
+    求解，直接写 qpos 的孪生路径必须手动同步第二根手指。
+    """
     qmap = joint_qpos_map(model)
     n = 0
     for name, val in positions.items():
@@ -219,6 +314,10 @@ def apply_joint_positions(model: mujoco.MjModel, data: mujoco.MjData,
             continue
         data.qpos[idx] = float(val)
         n += 1
+        if name.endswith("finger_joint1"):
+            twin = qmap.get(name.replace("joint1", "joint2"))
+            if twin is not None:
+                data.qpos[twin] = float(val)
     return n
 
 

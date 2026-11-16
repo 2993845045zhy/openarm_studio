@@ -93,8 +93,7 @@ class MjEmbedRenderer:
         self._model_ref = model
         if self._opt is None:
             self._opt = mujoco.MjvOption()
-            # 默认只开 0-2 组；障碍/线框在 3-5 组
-            self._opt.geomgroup[3] = 1
+            # 组 0-2 默认开；3=碰撞体（默认隐藏，"碰撞体"叠加开关控制）
             self._opt.geomgroup[4] = 1
             self._opt.geomgroup[5] = 1
         if self._cam is None:
@@ -109,6 +108,7 @@ class MjEmbedRenderer:
         apply_cam_state(self._cam, cam_state)
         self._opt.flags[mujoco.mjtVisFlag.mjVIS_TRANSPARENT] = bool(
             cam_state.get("transparent", False))
+        self._opt.geomgroup[3] = 1 if cam_state.get("collision", False) else 0
         self._renderer.update_scene(data, camera=self._cam, scene_option=self._opt)
         scn = self._renderer.scene
         scn.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = 0

@@ -56,6 +56,7 @@ class MujocoViewPanel(QWidget):
         self._cam_s = dict(VIEW_PRESETS["home"])
         self._wireframe = False
         self._transparent = False
+        self._collision = False
         self._press: tuple[Qt.MouseButton, float, float] | None = None
 
         self._poll = QTimer(self)
@@ -86,6 +87,7 @@ class MujocoViewPanel(QWidget):
         st["aspect"] = max(0.4, self.width() / max(1, self.height()))
         st["wireframe"] = self._wireframe
         st["transparent"] = self._transparent
+        st["collision"] = self._collision
         return st
 
     # ── 对外操作 ──────────────────────────────────────
@@ -100,6 +102,8 @@ class MujocoViewPanel(QWidget):
             self._wireframe = bool(on)
         elif key == "transparent":
             self._transparent = bool(on)
+        elif key == "collision":
+            self._collision = bool(on)
 
     def apply_theme(self, pal: dict) -> None:
         # 底板颜色取卡片底色（与天空盒同色），letterbox 才不会露出深色边

@@ -106,11 +106,16 @@ def _mesh_rewrite(text: str, desc_root: Path) -> str:
         src = Path(m.group(1))
         if src.suffix.lower() != ".dae":
             return m.group(0)
-        for cand in (src.with_suffix(".stl"),
-                     Path(str(src).replace("/visual/", "/collision/")).with_suffix(".stl")):
-            if cand.exists():
-                return f'filename="{cand}"'
-        return m.group(0)
+        # .dae → 按颜色拆分的 STL（首片代表整体，scene.py 展开多色）
+        try:
+            shards = _convert_dae(src)
+            return f'filename="{shards[0]}"'
+        except Exception:  # noqa: BLE001
+            for cand in (src.with_suffix(".stl"),
+                         Path(str(src).replace("/visual/", "/collision/")).with_suffix(".stl")):
+                if cand.exists():
+                    return f'filename="{cand}"'
+            return m.group(0)
 
     return re.sub(r'filename="([^"]*)"', repl, text)
 
@@ -120,11 +125,135 @@ COMPILER = (
     'strippath="false" angle="radian" discardvisual="false"/></mujoco>'
 )
 
+_MESH_CACHE: Path | None = None
+
+
+def _mesh_cache() -> Path:
+    global _MESH_CACHE
+    if _MESH_CACHE is None:
+        _MESH_CACHE = Path.home() / ".cache/openarm_studio/meshes"
+        _MESH_CACHE.mkdir(parents=True, exist_ok=True)
+    return _MESH_CACHE
+
+
+def _convert_dae(src: Path) -> list[Path]:
+    """DAE → 按材质颜色拆分的多片 STL（返回清单，首片代表整体）。
+
+    MuJoCo 不支持 COLLADA，而 STL 不带颜色。dae 里每种部件颜色
+    （银色金属件/3D 打印灰黑/电机黑）各是一组 geometry——这里按颜色
+    分组各自导出 STL，scene.py 再把它们复制成多个 geom 并绑上
+    对应颜色的材质，还原 RViz 里的着色。
+
+    分片命名 {stem}_{idx}_{hash}.stl；同前缀即同源。
+    """
+    import hashlib
+
+    key = hashlib.sha256(str(src).encode()).hexdigest()[:10]
+    prefix = f"{src.stem}"
+    out_dir = _mesh_cache()
+    marker = out_dir / f"{prefix}_0_{key}.stl"
+    if marker.exists() and marker.stat().st_size > 0 and list(out_dir.glob(f"{prefix}_*_{key}.stl")):
+        return sorted(out_dir.glob(f"{prefix}_*_{key}.stl"))
+
+    import numpy as np
+    import trimesh
+
+    scene = trimesh.load(str(src), force="scene")
+    groups: dict[tuple, list] = {}
+    for geom in (scene.geometry or {}).values():
+        color = None
+        mat = getattr(geom.visual, "material", None)
+        try:
+            if hasattr(mat, "main_color"):
+                color = tuple(int(c) for c in mat.main_color[:3])
+            elif hasattr(mat, "baseColor"):
+                color = tuple(int(c) for c in mat.baseColor[:3])
+        except Exception:  # noqa: BLE001
+            color = None
+        if color is None:
+            color = (160, 160, 160)
+        groups.setdefault(color, []).append(geom)
+
+    outs = []
+    meta_path = _mesh_cache() / "colors.json"
+    import json
+    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    for idx, (color, geoms) in enumerate(sorted(groups.items(), key=lambda kv: -sum(len(g.faces) for g in kv[1]))):
+        verts = np.vstack([np.asarray(g.vertices, dtype=np.float64) for g in geoms])
+        faces = []
+        offset = 0
+        for g in geoms:
+            f = np.asarray(g.faces, dtype=np.int64) + offset
+            faces.append(f)
+            offset += len(g.vertices)
+        mesh = trimesh.Trimesh(vertices=verts, faces=np.vstack(faces), process=False)
+        out = out_dir / f"{prefix}_{idx}_{key}.stl"
+        mesh.export(str(out))
+        outs.append(out)
+        meta[f"{prefix}_{idx}_{key}"] = list(color)
+    meta_path.write_text(json.dumps(meta))
+    return outs
+
+
+def dae_color_map() -> dict[str, tuple]:
+    """分片文件名前缀（含 hash）→ 各分片的颜色（从 STL 头? 不存——重建映射）。
+
+    颜色信息在拆分时已知，但 STL 不带色。为避免二次解析，转换时把
+    prefix+idx → rgb 写进 sidecar JSON。
+    """
+    import json
+
+    meta = _mesh_cache() / "colors.json"
+    if meta.exists():
+        return {k: tuple(v) for k, v in json.loads(meta.read_text()).items()}
+    return {}
+
+
+_SHARD_RE = re.compile(r"^(?P<stem>.+)_(?P<idx>\d+)_(?P<hash>[0-9a-f]{10})\.stl$")
+
+
+def _expand_visual_shards(text: str) -> str:
+    """把指向分片 0 的 <visual> 复制成 N 份（每色一片）。
+
+    URDF 允许一个 link 多个 visual；MjSpec 会为每个 visual 生成一个
+    geom。分片 idx 与 colors.json 的颜色一一对应。
+    """
+    cache = _mesh_cache()
+    import re as _re
+
+    def repl(m: _re.Match[str]) -> str:
+        block = m.group(0)
+        fname = _re.search(r'filename="([^"]+)"', block)
+        if not fname:
+            return block
+        shard = Path(fname.group(1)).name
+        hit = _SHARD_RE.match(shard)
+        if not hit or hit.group("idx") != "0":
+            return block
+        prefix, key = hit.group("stem"), hit.group("hash")
+        siblings = sorted(cache.glob(f"{prefix}_*_{key}.stl"))
+        if len(siblings) <= 1:
+            return block
+        extra = []
+        for i, sib in enumerate(siblings[1:], start=1):
+            idx = _SHARD_RE.match(sib.name).group("idx")
+            new_block = block.replace(fname.group(1), str(sib))
+            name_m = _re.search(r'name="([^"]+)"', new_block)
+            if name_m:
+                new_block = new_block.replace(
+                    f'name="{name_m.group(1)}"',
+                    f'name="{name_m.group(1)}_c{idx}"')
+            extra.append(new_block)
+        return block + "".join(extra)
+
+    return _re.sub(r"<visual\b[^>]*>.*?</visual>", repl, text, flags=_re.S)
+
 
 def preprocess(raw: str, desc_root: Path) -> str:
-    """注释剥离 → 网格路径改写 → 注入 compiler 选项。"""
+    """注释剥离 → 网格路径改写 → 多色 visual 展开 → 注入 compiler 选项。"""
     text = re.sub(r"<!--.*?-->", "", raw, flags=re.S)
     text = _mesh_rewrite(text, desc_root)
+    text = _expand_visual_shards(text)
     return re.sub(r"(<robot[^>]*>)", r"\1\n" + COMPILER, text, count=1)
 
 
