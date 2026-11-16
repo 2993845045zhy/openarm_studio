@@ -16,7 +16,7 @@ import mujoco
 import numpy as np
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout,
+from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout, QSpinBox,
                                QLabel, QMainWindow, QPlainTextEdit, QPushButton,
                                QSlider, QSplitter, QTabWidget, QVBoxLayout,
                                QWidget)
@@ -100,7 +100,7 @@ class RenderWorker(threading.Thread):
 
     # ── 主循环 ────────────────────────────────────────
     def run(self) -> None:
-        renderer = MjEmbedRenderer(height=720)
+        renderer = MjEmbedRenderer(height=640)
         try:
             while self._running:
                 with self._lock:
@@ -154,7 +154,7 @@ class RenderWorker(threading.Thread):
                 state = self._panel.cam_state()
                 rgb = renderer.render(self.model, render_data, state)
                 self._panel.push_frame(rgb, wire=state.get("wireframe"))
-                time.sleep(1 / 30)
+                time.sleep(1 / 60)
         except Exception as exc:  # noqa: BLE001
             self._log(f"[3D] 渲染线程异常: {type(exc).__name__}: {exc}")
         finally:
@@ -184,6 +184,9 @@ class StudioWindow(QMainWindow):
         self._stack = StackManager(on_log=lambda m: self.log_sig.emit(m))
         self._named_states: dict[str, dict[str, list[float]]] = \
             {g: dict(v) for g, v in FALLBACK_STATES.items()}
+        self._conn_state = "disconnected"
+        self._wait_timer = None
+        self._wait_t0 = 0.0
 
         self.setWindowTitle("OpenArm Studio")
         self.resize(1560, 960)
@@ -305,30 +308,19 @@ class StudioWindow(QMainWindow):
         self.sw_mode.currentIndexChanged.connect(self._on_mode_change)
         lay.addWidget(self.sw_mode)
 
-        # 主操作（整宽）+ 重置（ghost）
-        self.btn_start = QPushButton("启动", nav)
-        self.btn_start.setObjectName("btnPrimary")
-        self.btn_start.setCursor(Qt.PointingHandCursor)
-        lay.addWidget(self.btn_start)
+        # 连接（整宽主按钮，连接/断开切换）+ 急停
+        self.btn_connect = QPushButton("连接", nav)
+        self.btn_connect.setObjectName("btnPrimary")
+        self.btn_connect.setCursor(Qt.PointingHandCursor)
+        self.btn_connect.clicked.connect(self._on_connect_toggle)
+        lay.addWidget(self.btn_connect)
 
-        self.btn_reset = QPushButton("重置", nav)
-        self.btn_reset.setObjectName("navAction")
-        self.btn_reset.setCursor(Qt.PointingHandCursor)
-        self.btn_reset.setIcon(ICONS.get("reset", palette(self._theme_name)["ink2"], 15))
-        self.btn_reset.clicked.connect(self._on_reset)
-        lay.addWidget(self.btn_reset)
-
-        # 服务控制（停止 / 急停：不再挤在主按钮行）
-        ctl = QHBoxLayout()
-        ctl.setSpacing(4)
-        self.btn_stop = QPushButton("停止", nav)
-        self.btn_stop.setObjectName("btnDanger")
         self.btn_estop = QPushButton("急停", nav)
         self.btn_estop.setObjectName("btnEstop")
-        for b in (self.btn_stop, self.btn_estop):
-            b.setCursor(Qt.PointingHandCursor)
-            ctl.addWidget(b, 1)
-        lay.addLayout(ctl)
+        self.btn_estop.setCursor(Qt.PointingHandCursor)
+        self.btn_estop.setEnabled(False)
+        self.btn_estop.clicked.connect(self._on_estop)
+        lay.addWidget(self.btn_estop)
 
         # 可折叠分组 + 图标导航行
         self.nav_groups: list[tuple[NavGroupHeader, list[NavItem]]] = []
@@ -402,10 +394,6 @@ class StudioWindow(QMainWindow):
             self.sum_rows[key] = v
         lay.addWidget(recent)
 
-        # 命令面板行
-        self.cmd_row = NavCommandRow(palette(self._theme_name), nav)
-        lay.addWidget(self.cmd_row)
-
         # 页脚：主题分段 + 状态点 + 齿轮
         foot = QHBoxLayout()
         foot.setSpacing(6)
@@ -416,16 +404,8 @@ class StudioWindow(QMainWindow):
         foot.addWidget(self.sw_theme, 1)
         lay.addLayout(foot)
 
-        foot2 = QHBoxLayout()
-        foot2.setSpacing(6)
-        self.status_dot = StatusDot(palette(self._theme_name), "就绪", nav)
-        foot2.addWidget(self.status_dot, 1)
-        self.btn_gear = QPushButton(nav)
-        self.btn_gear.setObjectName("navIconBtn")
-        self.btn_gear.setIcon(ICONS.get("sliders", palette(self._theme_name)["ink2"], 15))
-        self.btn_gear.setCursor(Qt.PointingHandCursor)
-        foot2.addWidget(self.btn_gear)
-        lay.addLayout(foot2)
+        self.status_dot = StatusDot(palette(self._theme_name), "未连接", nav)
+        lay.addWidget(self.status_dot)
         return nav
 
     def _nav_group(self, title: str, items: list[tuple[str, str, int]]) -> QWidget:
@@ -668,6 +648,26 @@ class StudioWindow(QMainWindow):
             self.spin_vel.addItem(pct)
         self.spin_vel.setCurrentIndex(1)
         card.add(SettingsRow("速度", self.spin_vel, "", card))
+        card.add(GroupRule(card))
+
+        self.combo_planner = QComboBox(card)
+        self.combo_planner.addItems(
+            ["RRTConnect", "RRT", "RRTstar", "PRM", "PRMstar", "EST", "LBKPIECE"])
+        card.add(SettingsRow("规划器", self.combo_planner, "", card))
+        card.add(GroupRule(card))
+
+        self.spin_time = QDoubleSpinBox(card)
+        self.spin_time.setRange(0.5, 30.0)
+        self.spin_time.setSingleStep(0.5)
+        self.spin_time.setValue(5.0)
+        self.spin_time.setSuffix(" s")
+        card.add(SettingsRow("规划时间", self.spin_time, "", card))
+        card.add(GroupRule(card))
+
+        self.spin_attempts = QSpinBox(card)
+        self.spin_attempts.setRange(1, 50)
+        self.spin_attempts.setValue(10)
+        card.add(SettingsRow("尝试次数", self.spin_attempts, "", card))
         vl.addWidget(card)
 
         # 关节目标（选中规划组后按关节数生成）
@@ -683,17 +683,20 @@ class StudioWindow(QMainWindow):
         card3 = GroupCard("规划执行", page)
         row = QHBoxLayout()
         row.setSpacing(6)
-        self.btn_plan = QPushButton("规划预览", card3)
+        self.btn_plan = QPushButton("规划", card3)
         self.btn_plan.setCursor(Qt.PointingHandCursor)
         self.btn_plan.clicked.connect(lambda: self._do_plan(execute=False))
-        self.btn_exec = QPushButton("规划并执行", card3)
-        self.btn_exec.setObjectName("btnPrimary")
+        self.btn_exec = QPushButton("执行", card3)
         self.btn_exec.setCursor(Qt.PointingHandCursor)
         self.btn_exec.clicked.connect(lambda: self._do_plan(execute=True))
+        self.btn_planexec = QPushButton("规划并执行", card3)
+        self.btn_planexec.setObjectName("btnPrimary")
+        self.btn_planexec.setCursor(Qt.PointingHandCursor)
+        self.btn_planexec.clicked.connect(lambda: self._do_plan(execute=True, plan_first=True))
         holder = QWidget(card3)
         holder.setLayout(row)
-        row.addWidget(self.btn_plan, 1)
-        row.addWidget(self.btn_exec, 1)
+        for b in (self.btn_plan, self.btn_exec, self.btn_planexec):
+            row.addWidget(b, 1)
         card3.add(holder)
         self.lbl_plan = QLabel("点「启动」后即可规划：仿真模式走假硬件"
                                "（不需要真电机），真机模式才驱动电机", card3)
@@ -753,278 +756,56 @@ class StudioWindow(QMainWindow):
             out.append(s.value() / 1000.0 if fing else s.value() / 100.0)
         return out
 
-    def _do_plan(self, execute: bool) -> None:
+    def _do_plan(self, execute: bool, plan_first: bool = False) -> None:
+        """规划 / 执行 / 规划并执行。
+
+        execute=False → plan_only（3D 里播预览，不动臂）
+        execute=True  → 直接执行
+        plan_first    → 先规划，成功后再自动执行（等同"规划并执行"）
+        """
         mc = self._moveit
         if mc is None:
             self._log("MoveIt 客户端未初始化")
             return
+        if not self._connected:
+            self._log("未连接：请先点「连接」（仿真用假硬件，不碰电机）")
+            self.lbl_plan.setText("未连接")
+            return
+
         group = self.combo_group.currentText()
         vel = float(self.spin_vel.currentText().rstrip("%")) / 100.0
-        state = self.combo_named.currentText()
-        if state and not execute:
-            self._log(f"按关节滑块目标规划（{group}，速度 {vel:.0%}）")
+        planner = f"geometric::{self.combo_planner.currentText()}" \
+            if self.combo_planner.currentText().startswith("RRT") \
+            else f"geometric::{self.combo_planner.currentText()}"
+        ptime = self.spin_time.value()
+        attempts = self.spin_attempts.value()
+        goal = self._goal_values()
+        if not goal:
+            self._log("该规划组没有关节目标")
+            return
+
+        self._log(f"{'规划' if not execute else '执行'} {group}"
+                  f"（{planner}，{ptime:.1f}s，{attempts} 次，速度 {vel:.0%}）")
+        do_exec = execute and not plan_first
+        chained = {"pending": plan_first}
 
         def done(ok: bool, text: str) -> None:
             self.log_sig.emit(("✓ " if ok else "✗ ") + text)
             self.lbl_plan.setText(text)
+            if not ok or not chained["pending"]:
+                return
+            chained["pending"] = False
+            # 规划成功 → 直接执行同一关节目标
+            mc.plan_joint(group, goal, done2, execute=True, vel=vel, acc=vel,
+                          planner_id=planner, planning_time=ptime,
+                          attempts=attempts)
 
-        mc.plan_joint(group, self._goal_values(), done,
-                      execute=execute, vel=vel, acc=vel)
+        def done2(ok: bool, text: str) -> None:
+            self.log_sig.emit(("✓ " if ok else "✗ ") + text)
+            self.lbl_plan.setText(text)
 
-    def _page_log(self) -> QWidget:
-        page = QWidget(self)
-        vl = QVBoxLayout(page)
-        vl.setContentsMargins(0, 8, 0, 0)
-        vl.setSpacing(6)
-        self.log_view = QPlainTextEdit(page)
-        self.log_view.setReadOnly(True)
-        self.log_view.setMaximumBlockCount(2000)
-        vl.addWidget(self.log_view, 1)
-        return page
-
-    # ── 主工作区 ──────────────────────────────────────
-    def _build_workspace(self) -> QWidget:
-        card = QFrame(self)
-        card.setObjectName("workspaceCard")
-        lay = QVBoxLayout(card)
-        lay.setContentsMargins(6, 6, 6, 6)
-        lay.setSpacing(6)
-
-        split = QSplitter(Qt.Horizontal, card)
-        split.setHandleWidth(8)
-        split.setChildrenCollapsible(False)
-
-        split.addWidget(self._build_status_card(split))
-        split.addWidget(self._build_3d_card(split))
-        split.setSizes([430, 700])
-        lay.addWidget(split, 1)
-        return card
-
-    def _build_status_card(self, parent) -> QWidget:
-        # pbvs 风格：工作区内区域透明，靠发丝线分区（不再叠卡片）
-        host = QWidget(parent)
-        host.setMinimumWidth(360)
-        lay = QVBoxLayout(host)
-        lay.setContentsMargins(6, 4, 6, 4)
-        lay.setSpacing(8)
-
-        head = QHBoxLayout()
-        head.setSpacing(6)
-        title = QLabel("状态", host)
-        title.setObjectName("sectionHead")
-        self.chip_src = QLabel("未连接", host)
-        self.chip_src.setObjectName("statusChip")
-        head.addWidget(title)
-        head.addStretch(1)
-        head.addWidget(self.chip_src)
-        lay.addLayout(head)
-
-        strip = QFrame(host)
-        strip.setObjectName("statBar")
-        sl = QHBoxLayout(strip)
-        sl.setContentsMargins(10, 8, 10, 9)
-        sl.setSpacing(6)
-        self.tile_left = StatTile("左臂", "--")
-        self.tile_right = StatTile("右臂", "--")
-        self.tile_grip = StatTile("夹爪", "--")
-        for t in (self.tile_left, self.tile_right, self.tile_grip):
-            sl.addWidget(t, 1)
-        lay.addWidget(strip)
-
-        self.tabs = QTabWidget(host)
-        self.tabs.setDocumentMode(True)
-        bar = AnimatedTabBar(self.tabs)
-        self._tabbars.append(bar)
-        self.tabs.setTabBar(bar)
-        self.tabs.addTab(self._build_joint_table(host), "关节")
-        self.tabs.addTab(self._build_log_tab(host), "日志")
-        lay.addWidget(self.tabs, 1)
-        return host
-
-    def _build_joint_table(self, parent) -> QWidget:
-        page = QWidget(parent)
-        vl = QVBoxLayout(page)
-        vl.setContentsMargins(0, 6, 0, 0)
-        vl.setSpacing(2)
-        self.joint_rows: dict[str, QLabel] = {}
-        for side, prefix in (("左臂", "openarm_left"), ("右臂", "openarm_right")):
-            head = QLabel(side, page)
-            head.setObjectName("groupLabel")
-            vl.addWidget(head)
-            for i in range(1, 8):
-                name = f"{prefix}_joint{i}"
-                row = QWidget(page)
-                row.setFixedHeight(20)
-                rl = QHBoxLayout(row)
-                rl.setContentsMargins(2, 0, 2, 0)
-                rl.setSpacing(6)
-                lbl = QLabel(f"J{i}", row)
-                lbl.setObjectName("jointName")
-                lbl.setFixedWidth(24)
-                val = QLabel("--", row)
-                val.setObjectName("jointVal")
-                val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                rl.addWidget(lbl)
-                rl.addStretch(1)
-                rl.addWidget(val)
-                vl.addWidget(row)
-                self.joint_rows[name] = val
-        vl.addStretch(1)
-        return page
-
-    def _build_log_tab(self, parent) -> QWidget:
-        page = QWidget(parent)
-        vl = QVBoxLayout(page)
-        vl.setContentsMargins(0, 6, 0, 0)
-        self.log_inline = QPlainTextEdit(page)
-        self.log_inline.setReadOnly(True)
-        self.log_inline.setMaximumBlockCount(1000)
-        vl.addWidget(self.log_inline, 1)
-        return page
-
-    def _build_3d_card(self, parent) -> QWidget:
-        # pbvs 风格：3D 无框融合——sceneFrame 一圈发丝边把画面圈住
-        card = QFrame(parent)
-        card.setObjectName("view3dCard")
-        lay = QVBoxLayout(card)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(6)
-
-        head = QHBoxLayout()
-        head.setContentsMargins(6, 0, 6, 0)
-        head.setSpacing(4)
-        title = QLabel("3D 场景", card)
-        title.setObjectName("sectionHead")
-        self.chip_scene = QLabel("数字孪生", card)
-        self.chip_scene.setObjectName("statusChip")
-        head.addWidget(title)
-        head.addWidget(self.chip_scene)
-        head.addStretch(1)
-        for key, text in (("home", "复位"), ("front", "前"), ("side", "侧"), ("top", "顶")):
-            b = QPushButton(text, card)
-            b.setObjectName("chip")
-            b.setCursor(Qt.PointingHandCursor)
-            b.clicked.connect(lambda _=False, k=key: self.view.set_view_preset(k))
-            head.addWidget(b)
-        lay.addLayout(head)
-
-        frame = QFrame(card)
-        frame.setObjectName("sceneFrame")
-        flay = QVBoxLayout(frame)
-        flay.setContentsMargins(0, 0, 0, 0)
-        self.view = MujocoViewPanel(frame)
-        flay.addWidget(self.view)
-        lay.addWidget(frame, 1)
-
-        # 底部工具条（pbvs 同款：视角 | 显示 | 叠加）
-        bar = QHBoxLayout()
-        bar.setContentsMargins(6, 0, 6, 0)
-        bar.setSpacing(3)
-        lbl = QLabel("视角", card)
-        lbl.setObjectName("toolLabel")
-        bar.addWidget(lbl)
-        for key, text in (("home", "复位"), ("front", "前"), ("side", "侧"), ("top", "顶")):
-            b = ToolChip(text, card)
-            b.clicked.connect(lambda _=False, k=key: self.view.set_view_preset(k))
-            bar.addWidget(b)
-        bar.addStretch(1)
-        self.btn_wire_q = ToolChip("线框", card, checkable=True)
-        self.btn_wire_q.toggled.connect(lambda on: self.view.set_overlay("wireframe", on))
-        self.btn_col_q = ToolChip("碰撞体", card, checkable=True)
-        self.btn_col_q.toggled.connect(lambda on: self.view.set_overlay("collision", on))
-        lbl2 = QLabel("显示", card)
-        lbl2.setObjectName("toolLabel")
-        bar.addWidget(lbl2)
-        bar.addWidget(self.btn_wire_q)
-        bar.addWidget(self.btn_col_q)
-        lay.addLayout(bar)
-
-        self.joint_overlay = JointOverlay(self._joint_provider, palette(self._theme_name), self.view)
-        self.joint_overlay.move(10, 10)
-        self.joint_overlay.adjustSize()
-        return card
-
-    # ── 关节滑块 ──────────────────────────────────────
-    def _rebuild_sliders(self) -> None:
-        while self._slider_layout.count():
-            item = self._slider_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                w.deleteLater()
-        self._sliders.clear()
-        prefix = "openarm_left" if self.combo_arm.currentIndex() == 0 else "openarm_right"
-        names = [f"{prefix}_joint{i}" for i in range(1, 8)]
-        names.append(f"{prefix}_finger_joint1")
-        for i, name in enumerate(names):
-            row = QWidget(self._slider_host)
-            rl = QVBoxLayout(row)
-            rl.setContentsMargins(0, 0, 0, 0)
-            rl.setSpacing(1)
-            top = QHBoxLayout()
-            top.setContentsMargins(0, 0, 0, 0)
-            lbl = QLabel(f"J{i + 1}" if i < 7 else "夹爪", row)
-            lbl.setObjectName("jointName")
-            val = QLabel("+0.000", row)
-            val.setObjectName("jointVal")
-            val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            top.addWidget(lbl)
-            top.addStretch(1)
-            top.addWidget(val)
-            s = QSlider(Qt.Horizontal, row)
-            if i < 7:
-                s.setRange(-314, 314)   # ±3.14 rad
-            else:
-                s.setRange(0, 44)       # 0–0.044 m
-            s.setValue(0)
-            s.valueChanged.connect(lambda v, n=name: self._on_slider(n, v))
-            rl.addLayout(top)
-            rl.addWidget(s)
-            self._slider_layout.addWidget(row)
-            self._sliders[name] = (s, val)
-
-    def _on_slider(self, name: str, raw: int) -> None:
-        is_grip = "finger" in name
-        val = raw / 1000.0 if is_grip else raw / 100.0
-        pair = self._sliders.get(name)
-        if pair:
-            pair[1].setText(f"{val:+.3f}" if not is_grip else f"{val:.3f}")
-        self._local_pose[name] = val
-        if self._worker and not self._following_real():
-            self._worker.set_pose(self._local_pose)
-
-    def _zero_pose(self) -> None:
-        for s, val in self._sliders.values():
-            s.blockSignals(True)
-            s.setValue(0)
-            s.blockSignals(False)
-            val.setText("+0.000")
-        # 只清滑块涉及的关节，别把另一条臂的姿态也抹掉
-        prefix = "openarm_left" if self.combo_arm.currentIndex() == 0 else "openarm_right"
-        for name in list(self._local_pose):
-            if name.startswith(prefix):
-                self._local_pose.pop(name, None)
-        if self._worker and not self._following_real():
-            self._worker.set_pose(self._local_pose)
-
-    def _following_real(self) -> bool:
-        # 仿真模式下状态源是 MuJoCo 自己，不跟真机
-        if self._is_sim:
-            return False
-        return self.bridge is not None and self.bridge.connected
-
-    def _effective_pose(self) -> dict[str, float]:
-        """仿真 → MuJoCo 物理状态；真机在线 → /joint_states；否则本地滑块姿态。"""
-        if self._is_sim and self._worker is not None:
-            pos = self._worker.positions()
-            if pos:
-                return pos
-        if self._following_real():
-            assert self.bridge is not None
-            return self.bridge.positions()
-        return dict(self._local_pose)
-
-    def _joint_provider(self) -> dict[str, float]:
-        return self._effective_pose()
+        mc.plan_joint(group, goal, done, execute=do_exec, vel=vel, acc=vel,
+                      planner_id=planner, planning_time=ptime, attempts=attempts)
 
     # ── 页面切换 ──────────────────────────────────────
     _PAGE_META = [
@@ -1055,13 +836,9 @@ class StudioWindow(QMainWindow):
         ICONS.clear()
         self.win_btns.apply_palette(pal)
         self.view.apply_theme(pal)
-        self.joint_overlay.apply_palette(pal)
         # 自绘组件要单独喂配色（QSS 管不到 QPainter）
         self.logo.set_palette_colors(pal)
         self.status_dot.set_palette_colors(pal)
-        self.cmd_row.set_palette_colors(pal)
-        self.btn_gear.setIcon(ICONS.get("sliders", pal["ink2"], 15))
-        self.btn_reset.setIcon(ICONS.get("reset", pal["ink2"], 15))
         for header, rows in self.nav_groups:
             header.set_palette_colors(pal)
             for item in rows:
@@ -1097,61 +874,290 @@ class StudioWindow(QMainWindow):
             self._on_group_changed(self.combo_group.currentText())
             self._bind_actions()
 
-    # ── 真实动作绑定 ──────────────────────────────────
+    # ── 连接状态机 ────────────────────────────────────
     def _bind_actions(self) -> None:
-        self.btn_start.clicked.connect(self._on_start)
-        self.btn_stop.clicked.connect(self._on_stop)
-        self.btn_estop.clicked.connect(self._on_estop)
-        self.btn_gear.clicked.connect(lambda: self._goto_page(1))
+        self.btn_connect.setEnabled(True)
 
-    def _on_start(self) -> None:
-        """启动规划栈。
+    @property
+    def _connected(self) -> bool:
+        return self._conn_state == "connected"
 
-        两种都不需要真电机：
-        - 仿真模式 → 假硬件（mock_components），MoveIt 规划+执行全可用，
-          执行是"指令直接到位"，孪生跟着走
-        - 真机模式 → 真硬件，需要 CAN 与电机
-        """
+    def _set_conn_state(self, state: str, text: str) -> None:
+        self._conn_state = state
+        self.btn_connect.setText({
+            "disconnected": "连接", "connecting": "连接中…", "connected": "断开",
+        }.get(state, "连接"))
+        self.btn_connect.setEnabled(state != "connecting")
+        self.btn_estop.setEnabled(state == "connected" and not self._is_sim)
+        self.sum_rows["状态"].setText(text)
+        color = {"disconnected": self._pal_now["muted"],
+                 "connecting": self._pal_now["warn"],
+                 "connected": self._pal_now["success"]}[state]
+        self.status_dot.set_state(color, text, breathe=(state == "connecting"))
+
+    def _on_connect_toggle(self) -> None:
+        if self._conn_state == "connected":
+            self._disconnect()
+        else:
+            self._connect()
+
+    def _connect(self) -> None:
+        """连接 = 起官方栈并等待 MoveIt 就绪。仿真用假硬件（不碰电机）。"""
+        if self._conn_state != "disconnected":
+            return
         fake = self._is_sim
-        self._log("启动仿真栈（假硬件，无需真机）…" if fake
-                  else "启动真机栈（将驱动真实电机）…")
-        ok = self._stack.start(fake=fake)
-        self.sum_rows["状态"].setText("启动中…" if ok else "启动失败")
-        if ok and fake:
-            self._log("提示：假硬件模式下 MoveIt 可完整规划与执行，"
-                      "不碰电机；孪生仍显示 MuJoCo 视角")
+        self._set_conn_state("connecting", "连接中…")
+        self._log(f"连接：{'仿真（假硬件，不碰电机）' if fake else '真机'}")
+        if not self._stack.start(fake=fake):
+            self._set_conn_state("disconnected", "连接失败")
+            return
+        self._wait_timer = QTimer(self)
+        self._wait_timer.setInterval(700)
+        self._wait_t0 = time.time()
+        self._wait_timer.timeout.connect(self._poll_connect)
+        self._wait_timer.start()
 
-    def _on_stop(self) -> None:
-        self._log("停止真机栈…")
+    def _poll_connect(self) -> None:
+        mc = self._moveit
+        ctl = self._control
+        ready_mi = mc is not None and mc.ready(timeout=0.2)
+        ready_ctl = ctl is not None and ctl.managers_ready()
+        if ready_mi and ready_ctl:
+            self._wait_timer.stop()
+            self._set_conn_state("connected", "已连接")
+            self._log("已连接：MoveIt 与控制器就绪，可以规划")
+            return
+        if time.time() - self._wait_t0 > 90:
+            self._wait_timer.stop()
+            self._set_conn_state("disconnected", "连接超时")
+            self._log("连接超时：controller_manager 或 /move_action 未就绪")
+
+    def _disconnect(self) -> None:
+        self._set_conn_state("connecting", "断开中…")
         self._stack.stop()
-        self.sum_rows["状态"].setText("已停止")
+        self._set_conn_state("disconnected", "未连接")
+        self._log("已断开（进程确认归零，电机失能）")
 
     def _on_estop(self) -> None:
         if self._control is None:
             self._log("急停：控制器客户端未就绪")
             return
         ok = self._control.emergency_stop()
-        self._log("急停已下发（控制器全部停止 → 电机失能）" if ok
-                  else "急停下发失败——请立刻手动断电！")
-        self.sum_rows["状态"].setText("急停" if ok else "急停失败")
+        self._log("急停已下发（控制器全停 → 电机失能）" if ok
+                  else "急停下发失败——立刻手动断电！")
+        self._set_conn_state("connected", "急停" if ok else "急停失败")
 
     def _on_reset(self) -> None:
-        """重置：孪生/仿真归零；真机在线则规划双臂 home 并执行。"""
-        self._zero_pose()
-        mc = self._moveit
-        if mc is None or self._is_sim or not (self.bridge and self.bridge.connected):
-            return
-        self._log("重置：规划双臂 home…")
+        pass
 
-        def done(ok: bool, text: str) -> None:
-            self.log_sig.emit(("✓ " if ok else "✗ ") + "左臂 home：" + text)
+    # ── 主工作区 ──────────────────────────────────────
+    def _build_workspace(self) -> QWidget:
+        card = QFrame(self)
+        card.setObjectName("workspaceCard")
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(6)
+        split = QSplitter(Qt.Horizontal, card)
+        split.setHandleWidth(8)
+        split.setChildrenCollapsible(False)
+        split.addWidget(self._build_status_card(split))
+        split.addWidget(self._build_3d_card(split))
+        split.setSizes([420, 720])
+        lay.addWidget(split, 1)
+        return card
 
-        mc.plan_named("left_arm", "home", done, execute=True, vel=0.1, acc=0.1)
+    def _build_status_card(self, parent) -> QWidget:
+        host = QWidget(parent)
+        host.setMinimumWidth(340)
+        lay = QVBoxLayout(host)
+        lay.setContentsMargins(6, 4, 6, 4)
+        lay.setSpacing(8)
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        title = QLabel("状态", host)
+        title.setObjectName("sectionHead")
+        self.chip_src = QLabel("未连接", host)
+        self.chip_src.setObjectName("statusChip")
+        head.addWidget(title)
+        head.addStretch(1)
+        head.addWidget(self.chip_src)
+        lay.addLayout(head)
 
-        def done2(ok: bool, text: str) -> None:
-            self.log_sig.emit(("✓ " if ok else "✗ ") + "右臂 home：" + text)
+        strip = QFrame(host)
+        strip.setObjectName("statBar")
+        sl = QHBoxLayout(strip)
+        sl.setContentsMargins(10, 8, 10, 9)
+        sl.setSpacing(6)
+        self.tile_left = StatTile("左臂", "--")
+        self.tile_right = StatTile("右臂", "--")
+        self.tile_grip = StatTile("夹爪", "--")
+        for t in (self.tile_left, self.tile_right, self.tile_grip):
+            sl.addWidget(t, 1)
+        lay.addWidget(strip)
 
-        mc.plan_named("right_arm", "home", done2, execute=True, vel=0.1, acc=0.1)
+        self.tabs = QTabWidget(host)
+        self.tabs.setDocumentMode(True)
+        bar = AnimatedTabBar(self.tabs)
+        self._tabbars.append(bar)
+        self.tabs.setTabBar(bar)
+        self.tabs.addTab(self._build_joint_table(host), "关节")
+        lay.addWidget(self.tabs, 1)
+        return host
+
+    def _build_joint_table(self, parent) -> QWidget:
+        page = QWidget(parent)
+        vl = QVBoxLayout(page)
+        vl.setContentsMargins(0, 6, 0, 0)
+        vl.setSpacing(2)
+        self.joint_rows: dict[str, QLabel] = {}
+        for side, prefix in (("左臂", "openarm_left"), ("右臂", "openarm_right")):
+            head = QLabel(side, page)
+            head.setObjectName("groupTitle")
+            vl.addWidget(head)
+            for i in range(1, 8):
+                name = f"{prefix}_joint{i}"
+                row = QWidget(page)
+                row.setFixedHeight(20)
+                rl = QHBoxLayout(row)
+                rl.setContentsMargins(2, 0, 2, 0)
+                rl.setSpacing(6)
+                lbl = QLabel(f"J{i}", row)
+                lbl.setObjectName("jointName")
+                lbl.setFixedWidth(24)
+                val = QLabel("--", row)
+                val.setObjectName("jointVal")
+                val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                rl.addWidget(lbl)
+                rl.addStretch(1)
+                rl.addWidget(val)
+                vl.addWidget(row)
+                self.joint_rows[name] = val
+        vl.addStretch(1)
+        return page
+
+    def _build_3d_card(self, parent) -> QWidget:
+        card = QFrame(parent)
+        card.setObjectName("view3dCard")
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        head = QHBoxLayout()
+        head.setContentsMargins(6, 0, 6, 0)
+        head.setSpacing(4)
+        title = QLabel("3D 场景", card)
+        title.setObjectName("sectionHead")
+        self.chip_scene = QLabel("数字孪生", card)
+        self.chip_scene.setObjectName("statusChip")
+        head.addWidget(title)
+        head.addWidget(self.chip_scene)
+        head.addStretch(1)
+        for key, text in (("home", "复位"), ("front", "前"), ("side", "侧"),
+                          ("top", "顶")):
+            b = ToolChip(text, card)
+            b.clicked.connect(lambda _=False, k=key: self.view.set_view_preset(k))
+            head.addWidget(b)
+        lay.addLayout(head)
+
+        frame = QFrame(card)
+        frame.setObjectName("sceneFrame")
+        flay = QVBoxLayout(frame)
+        flay.setContentsMargins(0, 0, 0, 0)
+        self.view = MujocoViewPanel(frame)
+        flay.addWidget(self.view)
+        lay.addWidget(frame, 1)
+        return card
+
+    # ── 状态源 ───────────────────────────────────────
+    def _following_real(self) -> bool:
+        if self._is_sim:
+            return False
+        return self.bridge is not None and self.bridge.connected
+
+    def _effective_pose(self) -> dict[str, float]:
+        if self._following_real():
+            assert self.bridge is not None
+            return self.bridge.positions()
+        return dict(self._local_pose)
+
+    def _joint_provider(self) -> dict[str, float]:
+        return self._effective_pose()
+
+    def _page_log(self) -> QWidget:
+        page = QWidget(self)
+        vl = QVBoxLayout(page)
+        vl.setContentsMargins(0, 8, 0, 0)
+        vl.setSpacing(6)
+        self.log_view = QPlainTextEdit(page)
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(3000)
+        vl.addWidget(self.log_view, 1)
+        return page
+
+    # ── 关节直控（滑块）──────────────────────────────
+    def _rebuild_sliders(self) -> None:
+        while self._slider_layout.count():
+            item = self._slider_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._sliders.clear()
+        prefix = "openarm_left" if self.combo_arm.currentIndex() == 0 else "openarm_right"
+        names = [f"{prefix}_joint{i}" for i in range(1, 8)]
+        names.append(f"{prefix}_finger_joint1")
+        for i, name in enumerate(names):
+            row = QWidget(self._slider_host)
+            rl = QVBoxLayout(row)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.setSpacing(1)
+            top = QHBoxLayout()
+            top.setContentsMargins(0, 0, 0, 0)
+            lbl = QLabel(f"J{i + 1}" if i < 7 else "夹爪", row)
+            lbl.setObjectName("jointName")
+            val = QLabel("+0.000", row)
+            val.setObjectName("jointVal")
+            val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            top.addWidget(lbl)
+            top.addStretch(1)
+            top.addWidget(val)
+            sld = QSlider(Qt.Horizontal, row)
+            if i < 7:
+                sld.setRange(-314, 314)
+            else:
+                sld.setRange(0, 44)
+            sld.valueChanged.connect(lambda v, n=name: self._on_slider(n, v))
+            rl.addLayout(top)
+            rl.addWidget(sld)
+            self._slider_layout.addWidget(row)
+            self._sliders[name] = (sld, val)
+
+    def _on_slider(self, name: str, raw: int) -> None:
+        is_grip = "finger" in name
+        val = raw / 1000.0 if is_grip else raw / 100.0
+        pair = self._sliders.get(name)
+        if pair:
+            pair[1].setText(f"{val:+.3f}" if not is_grip else f"{val:.3f}")
+        self._local_pose[name] = val
+        if self._worker and not self._following_real():
+            self._worker.set_pose(self._local_pose)
+        # 真机已连接：走 forward_position 直接下发（绕过碰撞检查）
+        if self._connected and not self._is_sim and self._control is not None:
+            side = "left" if "left" in name else "right"
+            joints = [self._local_pose.get(f"openarm_{side}_joint{i}", 0.0)
+                      for i in range(1, 8)]
+            self._control.send_positions(side, joints)
+
+    def _zero_pose(self) -> None:
+        for sld, val in self._sliders.values():
+            sld.blockSignals(True)
+            sld.setValue(0)
+            sld.blockSignals(False)
+            val.setText("+0.000")
+        prefix = "openarm_left" if self.combo_arm.currentIndex() == 0 else "openarm_right"
+        for name in list(self._local_pose):
+            if name.startswith(prefix):
+                self._local_pose.pop(name, None)
+        if self._worker and not self._following_real():
+            self._worker.set_pose(self._local_pose)
 
     def _poll_controllers(self) -> None:
         """每 2 秒拉一次控制器状态（真实数据）。"""
@@ -1275,8 +1281,8 @@ class StudioWindow(QMainWindow):
     def _append_log(self, text: str) -> None:
         stamp = time.strftime("%H:%M:%S")
         line = f"[{stamp}] {text}"
-        self.log_inline.appendPlainText(line)
-        self.log_view.appendPlainText(line)
+        if hasattr(self, "log_view"):
+            self.log_view.appendPlainText(line)
 
     def _log(self, text: str) -> None:
         self.log_sig.emit(text)

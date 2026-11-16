@@ -87,7 +87,8 @@ class MoveItClient:
     def _build(self, group: str, *, joint_goal: list[float] | None = None,
                pose_goal: Pose | None = None, pose_reference: str = "",
                vel_scale: float = 0.1, acc_scale: float = 0.1,
-               plan_only: bool = False) -> MoveGroup.Goal:
+               plan_only: bool = False, planner_id: str = "",
+               planning_time: float = 5.0, attempts: int = 10) -> MoveGroup.Goal:
         req = MoveGroup.Goal()
         # planning_options 属于 Goal（不是 MotionPlanRequest）
         req.planning_options.plan_only = bool(plan_only)
@@ -97,8 +98,10 @@ class MoveItClient:
 
         r = req.request
         r.group_name = group
-        r.num_planning_attempts = 10
-        r.allowed_planning_time = 5.0
+        r.num_planning_attempts = int(attempts)
+        r.allowed_planning_time = float(planning_time)
+        if planner_id:
+            r.planner_id = planner_id
         r.max_velocity_scaling_factor = float(vel_scale)
         r.max_acceleration_scaling_factor = float(acc_scale)
 
@@ -199,22 +202,36 @@ class MoveItClient:
 
     # ── 便捷封装 ──────────────────────────────────────
     def plan_joint(self, group: str, joints: list[float], done_cb, *,
-                   execute: bool, vel: float = 0.1, acc: float = 0.1) -> bool:
+                   execute: bool, vel: float = 0.1, acc: float = 0.1,
+                   planner_id: str = "", planning_time: float = 5.0,
+                   attempts: int = 10) -> bool:
         return self.send(self._build(group, joint_goal=joints,
                                      vel_scale=vel, acc_scale=acc,
-                                     plan_only=not execute), done_cb)
+                                     plan_only=not execute,
+                                     planner_id=planner_id,
+                                     planning_time=planning_time,
+                                     attempts=attempts), done_cb)
 
     def plan_named(self, group: str, state: str, done_cb, *,
-                   execute: bool, vel: float = 0.1, acc: float = 0.1) -> bool:
+                   execute: bool, vel: float = 0.1, acc: float = 0.1,
+                   planner_id: str = "", planning_time: float = 5.0,
+                   attempts: int = 10) -> bool:
         vals = self.named_states.get(group, {}).get(state)
         if vals is None:
             done_cb(False, f"未知命名状态 {state}")
             return False
-        return self.plan_joint(group, vals, done_cb, execute=execute, vel=vel, acc=acc)
+        return self.plan_joint(group, vals, done_cb, execute=execute, vel=vel,
+                               acc=acc, planner_id=planner_id,
+                               planning_time=planning_time, attempts=attempts)
 
     def plan_pose(self, group: str, pose: Pose, done_cb, *,
                   execute: bool, frame: str = "world",
-                  vel: float = 0.1, acc: float = 0.1) -> bool:
+                  vel: float = 0.1, acc: float = 0.1,
+                  planner_id: str = "", planning_time: float = 5.0,
+                  attempts: int = 10) -> bool:
         return self.send(self._build(group, pose_goal=pose, pose_reference=frame,
                                      vel_scale=vel, acc_scale=acc,
-                                     plan_only=not execute), done_cb)
+                                     plan_only=not execute,
+                                     planner_id=planner_id,
+                                     planning_time=planning_time,
+                                     attempts=attempts), done_cb)
