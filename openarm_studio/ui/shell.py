@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout, Q
 from ..core.mjview import MjEmbedRenderer
 from ..core.sim import SimBackend
 from ..model import scene as model_scene
-from ..backend.sdk_arm import GRIP_OPEN, SdkArm
+from ..backend.driver_arm import CONFIGS, GRIP_OPEN_M as GRIP_OPEN, DriverArm
 from .chrome import DragHandle, ResizeHandles, WindowButtons
 from .icons import ICONS
 from .joint_monitor import JointOverlay
@@ -217,7 +217,7 @@ class StudioWindow(QMainWindow):
         self._reduced = False
         self._worker: RenderWorker | None = None
         # SDK 直连双臂：left→can1, right→can0（与 bringup 约定一致）
-        self.arms: dict[str, SdkArm] = {}
+        self.arms: dict[str, DriverArm] = {}
         self._cmd_rate_hz = 50.0     # 滑块下发频率
         self._local_pose: dict[str, float] = {}
         self.nav_items: list[NavItem] = []
@@ -544,6 +544,13 @@ class StudioWindow(QMainWindow):
         card.add(self.row_rate)
         vl.addWidget(card)
 
+        card_cfg = GroupCard("驱动配置", page)
+        self.combo_config = QComboBox(card_cfg)
+        self.combo_config.addItems(list(CONFIGS))
+        card_cfg.add(SettingsRow("openarm_driver", self.combo_config,
+                                 "限位/偏移/增益包（cell 带标定偏移；pedestal 零偏移）", card_cfg))
+        vl.addWidget(card_cfg)
+
         card2 = GroupCard("安全", page)
         self.btn_check = QPushButton("启动前检查", card2)
         self.btn_check.setCursor(Qt.PointingHandCursor)
@@ -760,7 +767,10 @@ class StudioWindow(QMainWindow):
         """后台连两条臂（打开 CAN + 轮询线程），成功后**不自动使能**。"""
         ok_any = False
         for side, can_if in (("right", "can0"), ("left", "can1")):
-            arm = SdkArm(side, can_if, on_log=lambda m: self.log_sig.emit(m))
+            arm = DriverArm(side, can_if,
+                            config_name=self.combo_config.currentText()
+                            if hasattr(self, "combo_config") else "openarm_cell",
+                            on_log=lambda m: self.log_sig.emit(m))
             if arm.connect():
                 self.arms[side] = arm
                 ok_any = True
@@ -796,20 +806,23 @@ class StudioWindow(QMainWindow):
         self._log("已断开（电机失能，进程无残留）")
 
     def _on_estop(self) -> None:
-        """急停：全部失能。真机注意手臂会失去力矩下垂。"""
+        """急停：立即 disable_all，无回程轨迹。真机注意手臂会失去力矩下垂。"""
         if not self.arms:
             self._log("急停：未连接")
             return
         for arm in self.arms.values():
-            arm.disable()
-        self._set_conn_state("connected", "已失能")
-        self._log("急停已执行：双臂电机全部失能（手臂无力矩，扶稳）")
+            arm.estop()
+        self._set_conn_state("connected", "急停")
+        self._log("急停已执行：双臂立即失能（无回程轨迹，扶稳）")
 
     def _on_enable_toggle(self) -> None:
         on = any(a.enabled for a in self.arms.values())
         for arm in self.arms.values():
-            (arm.disable if on else arm.enable)()
-        self.btn_enable.setText("使能" if on else "失能")
+            if on:
+                arm.disable()      # stop()：回程轨迹 + 失能
+            else:
+                arm.enable()       # start()：使能 + 走起始轨迹（臂会动！）
+        self.btn_enable.setText("失能" if not on else "使能")
         self.sum_rows["状态"].setText("已连接·已使能" if not on else "已连接·未使能")
 
     def _on_reset(self) -> None:
@@ -1032,6 +1045,8 @@ class StudioWindow(QMainWindow):
             arm = self.arms.get(side)
             if arm is None or not arm.connected:
                 lbl.setText("离线")
+            elif arm.safety_stop_reason:
+                lbl.setText("安全停止")
             else:
                 lbl.setText(f"{arm.rate:.0f}Hz·{'使能' if arm.enabled else '未使能'}")
 
