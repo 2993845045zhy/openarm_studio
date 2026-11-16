@@ -191,14 +191,27 @@ class HistoryRow(QWidget):
 
 
 class LogoButton(QWidget):
-    """左上角 logo：点击折叠导航轨。"""
+    """左上角 logo（双臂造型），点击折叠导航轨。
+
+    造型与 dock 图标同源：两条带肘关节的机械臂从共用肩部张开 + 底座。
+    曲线在 64 网格里定义，绘制时按控件尺寸缩放。
+    """
 
     clicked = Signal()
+
+    # 64 网格内的双臂路径（与 assets/openarm_studio.svg 一致）
+    _LEFT = ((31.0, 17.0), (19.5, 29.0), (25.5, 43.0))
+    _RIGHT = ((33.0, 17.0), (44.5, 29.0), (38.5, 43.0))
+    _BASE = ((24.0, 50.0), (40.0, 50.0))
+    _SHOULDER = (32.0, 15.5)
+    _ELBOWS = ((19.5, 29.0), (44.5, 29.0))
+    _WRISTS = ((25.5, 43.0), (38.5, 43.0))
 
     def __init__(self, pal: dict, parent=None):
         super().__init__(parent)
         self.setFixedSize(28, 28)
         self.setCursor(Qt.PointingHandCursor)
+        self.setToolTip("折叠 / 展开导航")
         self._pal = pal
 
     def set_palette_colors(self, pal: dict) -> None:
@@ -213,16 +226,36 @@ class LogoButton(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         pal = self._pal
-        rect = QRectF(1.5, 1.5, self.width() - 3, self.height() - 3)
-        # 断缝环（Logo 语义：闭环唯一不肯闭合的那道缝）
-        pen = QPen(QColor(pal.get("ink", "#d4d4d4")))
-        pen.setWidthF(2.4)
+        s = min(self.width(), self.height()) / 64.0
+        ox = (self.width() - 64 * s) / 2.0
+        oy = (self.height() - 64 * s) / 2.0
+
+        def pt(xy):
+            return QPointF(ox + xy[0] * s, oy + xy[1] * s)
+
+        ink = QColor(pal.get("ink", "#d4d4d4"))
+        accent = QColor(pal.get("accent", "#4099ff"))
+        pen = QPen(ink)
+        pen.setWidthF(max(1.6, 4.8 * s))
         pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
         p.setPen(pen)
-        p.drawArc(rect, int(72 * 16), int((360 - 72) * 16))
-        p.setBrush(QColor(pal.get("accent", "#4099ff")))
+        p.setBrush(Qt.NoBrush)
+        for arm in (self._LEFT, self._RIGHT):
+            path = QPainterPath(pt(arm[0]))
+            path.lineTo(pt(arm[1]))
+            path.lineTo(pt(arm[2]))
+            p.drawPath(path)
+        p.drawLine(pt(self._BASE[0]), pt(self._BASE[1]))
+
         p.setPen(Qt.NoPen)
-        p.drawEllipse(QPointF(rect.center().x(), rect.top() + 1.8), 1.9, 1.9)
+        p.setBrush(accent)
+        p.drawEllipse(pt(self._SHOULDER), max(2.0, 3.5 * s), max(2.0, 3.5 * s))
+        for w in self._WRISTS:
+            p.drawEllipse(pt(w), max(1.2, 1.9 * s), max(1.2, 1.9 * s))
+        p.setBrush(ink)
+        for e in self._ELBOWS:
+            p.drawEllipse(pt(e), max(1.4, 2.4 * s), max(1.4, 2.4 * s))
 
 
 # ── zcode Switch（32×18 胶囊 + 140ms 滑块）──────────────────

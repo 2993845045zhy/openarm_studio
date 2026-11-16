@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!--
+    OpenArm Studio 图标
+
+    概念：两条带肘部关节的机械臂从共用肩部张开、腕端朝下内收，
+    底座横梁表示共用基座。浅蓝点 = 肩关节，白点 = 肘关节。
+    单色 + 一色强调，16px 下仍能读出"双臂"轮廓。
+  -->
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#17171a"/>
+  <g fill="none" stroke="#f4f5f7" stroke-width="4.8"
+     stroke-linecap="round" stroke-linejoin="round">
+    <!-- 左臂：肩 → 肘 → 腕 -->
+    <path d="M31 17 L19.5 29 L25.5 43"/>
+    <!-- 右臂：肩 → 肘 → 腕 -->
+    <path d="M33 17 L44.5 29 L38.5 43"/>
+    <!-- 底座 -->
+    <path d="M24 50 H40"/>
+  </g>
+  <!-- 肩关节 -->
+  <circle cx="32" cy="15.5" r="3.5" fill="#4099ff"/>
+  <!-- 肘关节 -->
+  <circle cx="19.5" cy="29" r="2.4" fill="#f4f5f7"/>
+  <circle cx="44.5" cy="29" r="2.4" fill="#f4f5f7"/>
+  <!-- 腕端 -->
+  <circle cx="25.5" cy="43" r="1.9" fill="#4099ff"/>
+  <circle cx="38.5" cy="43" r="1.9" fill="#4099ff"/>
+</svg>

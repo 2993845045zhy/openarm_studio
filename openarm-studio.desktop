@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=OpenArm Studio
+Name[zh_CN]=OpenArm 上位机
+GenericName=Robot Workbench
+Comment=Dual-arm digital twin, MuJoCo simulation and MoveIt planning console
+Comment[zh_CN]=OpenArm 双臂数字孪生 / 仿真 / MoveIt 规划上位机
+Exec=/home/robot/openarm_studio/run_studio.sh
+Icon=openarm-studio
+Terminal=false
+Categories=Development;Science;
+Keywords=robot;ros2;mujoco;openarm;moveit;
+StartupWMClass=openarm_studio
+StartupNotify=true

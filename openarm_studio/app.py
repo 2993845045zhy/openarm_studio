@@ -9,13 +9,17 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 
 from PySide6.QtCore import QTimer  # noqa: E402
+from PySide6.QtGui import QIcon  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
 from .ui.shell import StudioWindow  # noqa: E402
+
+_ICON = Path(__file__).resolve().parent / "ui/assets/openarm_studio.svg"
 
 
 def main() -> int:
@@ -28,6 +32,9 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     app.setApplicationName("openarm_studio")
+    app.setDesktopFileName("openarm-studio")
+    if _ICON.exists():
+        app.setWindowIcon(QIcon(str(_ICON)))
 
     win = StudioWindow(theme_name=args.theme)
     if args.mode == "sim":
