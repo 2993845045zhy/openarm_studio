@@ -212,6 +212,7 @@ class RenderWorker(threading.Thread):
 # ────────────────────────────────────────────────────────────
 class StudioWindow(QMainWindow):
     log_sig = Signal(str)
+    conn_sig = Signal(bool, str)
 
     def __init__(self, theme_name: str = "dark"):
         super().__init__()
@@ -248,6 +249,7 @@ class StudioWindow(QMainWindow):
         self._start_bridge()
 
         self.log_sig.connect(self._append_log)
+        self.conn_sig.connect(self._on_conn_result)
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(200)
         self._status_timer.timeout.connect(self._refresh_status)
@@ -960,29 +962,44 @@ class StudioWindow(QMainWindow):
         fake = self._is_sim
         self._set_conn_state("connecting", "连接中…")
         self._log(f"连接：{'仿真（假硬件，不碰电机）' if fake else '真机'}")
+        # 自愈：如果探测到"已有栈在跑"但控制器根本拿不到，说明是残留/半死
+        # 的旧进程 —— 先清掉再重启，否则会一直连着"假栈"然后超时
+        if self._stack.running:
+            alive = self._control is not None and self._control.managers_ready_quick(3.0)
+            if not alive:
+                self._log("检测到残留栈进程但控制器无响应 → 清理后重启")
+                self._stack.stop()
         if not self._stack.start(fake=fake):
             self._set_conn_state("disconnected", "连接失败")
             return
-        self._wait_timer = QTimer(self)
-        self._wait_timer.setInterval(700)
-        self._wait_t0 = time.time()
-        self._wait_timer.timeout.connect(self._poll_connect)
-        self._wait_timer.start()
+        # 探测放后台线程：wait_for_server / list_controllers 都会阻塞，
+        # 放 GUI 线程会让界面假死（表现为"一直连接中"）
+        threading.Thread(target=self._connect_worker, daemon=True,
+                         name="openarm-connect").start()
 
-    def _poll_connect(self) -> None:
-        mc = self._moveit
-        ctl = self._control
-        ready_mi = mc is not None and mc.ready(timeout=0.2)
-        ready_ctl = ctl is not None and ctl.managers_ready()
-        if ready_mi and ready_ctl:
-            self._wait_timer.stop()
+    def _connect_worker(self) -> None:
+        t0 = time.time()
+        while time.time() - t0 < 90:
+            mc, ctl = self._moveit, self._control
+            try:
+                ready_mi = mc is not None and mc.ready(timeout=0.5)
+                ready_ctl = ctl is not None and ctl.managers_ready()
+            except Exception as exc:  # noqa: BLE001
+                self.conn_sig.emit(False, f"探测异常：{exc}")
+                return
+            if ready_mi and ready_ctl:
+                self.conn_sig.emit(True, "已连接")
+                return
+            time.sleep(1.0)
+        self.conn_sig.emit(False, "连接超时")
+
+    def _on_conn_result(self, ok: bool, text: str) -> None:
+        if ok:
             self._set_conn_state("connected", "已连接")
             self._log("已连接：MoveIt 与控制器就绪，可以规划")
-            return
-        if time.time() - self._wait_t0 > 90:
-            self._wait_timer.stop()
-            self._set_conn_state("disconnected", "连接超时")
-            self._log("连接超时：controller_manager 或 /move_action 未就绪")
+        else:
+            self._set_conn_state("disconnected", text)
+            self._log(f"连接失败：{text}")
 
     def _disconnect(self) -> None:
         self._set_conn_state("connecting", "断开中…")

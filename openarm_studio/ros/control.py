@@ -73,6 +73,17 @@ class ControlClient:
             return []
         return [(c.name, c.type, c.state) for c in res.controller]
 
+    def managers_ready_quick(self, timeout: float = 3.0) -> bool:
+        """限时探测：控制器列表非空即认为栈是活的。"""
+        import time as _t
+
+        t0 = _t.time()
+        while _t.time() - t0 < timeout:
+            if self.list_controllers(0.5):
+                return True
+            _t.sleep(0.3)
+        return False
+
     def managers_ready(self) -> bool:
         """能用 = 真能拿到控制器列表（含服务刚起来、还没 spawn 完的情况）。"""
         return bool(self.list_controllers(1.0))
