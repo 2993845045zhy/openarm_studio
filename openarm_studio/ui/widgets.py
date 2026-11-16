@@ -42,24 +42,33 @@ class GroupCard(QFrame):
 
 
 class Row(QWidget):
-    """zcode SettingsRow：左标题（fs_base/500/ink）+ 右值（等宽）。"""
+    """zcode SettingsRow 的单行键值：左键（ink2/500）+ 右值（等宽/ink）。"""
 
     def __init__(self, label: str, widget: QWidget | None = None,
                  parent=None, value: bool = False):
         super().__init__(parent)
         self.setObjectName("settingRowHost")
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(2, 0, 2, 0)
+        lay.setContentsMargins(2, 5, 2, 5)
         lay.setSpacing(8)
         self.lbl = QLabel(label, self)
-        self.lbl.setObjectName("fieldValue" if value else "settingTitle")
+        self.lbl.setObjectName("settingTitle")
         lay.addWidget(self.lbl)
         lay.addStretch(1)
         if widget is not None:
-            lay.addWidget(widget)
+            lay.addWidget(widget, 0, Qt.AlignVCenter)
+            self.val: QLabel | None = None
+        else:
+            self.val = QLabel("—", self)
+            self.val.setObjectName("fieldValue")
+            self.val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            lay.addWidget(self.val)
 
     def set_value(self, text: str) -> None:
-        self.lbl.setText(text)
+        if getattr(self, "val", None) is not None:
+            self.val.setText(text)
+        else:
+            self.lbl.setText(text)
 
 
 class StatTile(QFrame):

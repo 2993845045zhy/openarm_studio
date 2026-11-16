@@ -303,16 +303,22 @@ QPushButton#navItem:checked {
     color: $ink;
     font-weight: 600;
 }
-QLabel#navGroupHeader {
+QPushButton#navGroupHeader {
     background: transparent;
     border: none;
+    border-radius: 6px;
+    padding: 0 24px 0 10px;
+    text-align: left;
     color: $ink;
     font-size: $fs_base;
     font-weight: 600;
     min-height: 26px;
     max-height: 26px;
     letter-spacing: 0.01em;
-    padding-left: 10px;
+}
+QPushButton#navGroupHeader:hover {
+    background: transparent;
+    color: $ink;
 }
 QWidget#navGroupBody { background: transparent; }
 QWidget#historyRow { background: transparent; }

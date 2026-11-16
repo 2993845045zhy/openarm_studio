@@ -31,9 +31,12 @@ from .joint_monitor import JointOverlay
 from .mjview_panel import MujocoViewPanel
 from .switch import ModeSwitch
 from .theme import build_qss, palette, scene_colors
-from .widgets import GroupCard, Hairline, Row, StatTile
+from .widgets import GroupCard, Row, StatTile
+from .zcode import (AnimatedTabBar, GroupRule, HistoryRow, LogoButton, NavCommandRow,
+                    NavGroupHeader, NavItem, SettingsRow, StatusDot, Switch, ToolChip)
 
 SIDE_W = 236
+SIDE_COLLAPSED_W = 56
 INSP_W = 300
 
 
@@ -156,6 +159,10 @@ class StudioWindow(QMainWindow):
         self.bridge: RosBridge | None = None
         self.js_pub: JointStatePublisher | None = None
         self._local_pose: dict[str, float] = {}
+        self.nav_items: list[NavItem] = []
+        self._switches: list[Switch] = []
+        self._tabbars: list[AnimatedTabBar] = []
+        self._pal_now = palette(theme_name)
 
         self.setWindowTitle("OpenArm Studio")
         self.resize(1560, 960)
@@ -244,99 +251,177 @@ class StudioWindow(QMainWindow):
         nav.setMinimumWidth(SIDE_W)
         nav.setMaximumWidth(SIDE_W)
         lay = QVBoxLayout(nav)
-        lay.setContentsMargins(14, 12, 14, 12)
-        lay.setSpacing(10)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(8)
 
-        # 品牌区
+        # 品牌区：logo（点击折叠）+ 标题/副标题
         brand = QWidget(nav)
-        bl = QVBoxLayout(brand)
+        bl = QHBoxLayout(brand)
         bl.setContentsMargins(2, 0, 0, 0)
-        bl.setSpacing(1)
+        bl.setSpacing(9)
+        self.logo = LogoButton(palette(self._theme_name), brand)
+        self.logo.clicked.connect(self._toggle_nav)
+        bl.addWidget(self.logo, 0, Qt.AlignTop)
+        col = QVBoxLayout()
+        col.setContentsMargins(0, 1, 0, 0)
+        col.setSpacing(0)
         title = QLabel("OpenArm Studio", brand)
         title.setObjectName("navSummaryTitle")
-        sub = QLabel("双臂 · 数字孪生 · 仿真", brand)
+        sub = QLabel("双臂 · 数字孪生工作台", brand)
         sub.setObjectName("navFooter")
-        bl.addWidget(title)
-        bl.addWidget(sub)
+        col.addWidget(title)
+        col.addWidget(sub)
+        bl.addLayout(col, 1)
         lay.addWidget(brand)
 
-        # 模式
+        # 模式分段
         self.sw_mode = ModeSwitch(["真机", "仿真"], nav)
         self.sw_mode.currentIndexChanged.connect(self._on_mode_change)
         lay.addWidget(self.sw_mode)
 
-        # 运行控制（三键等高，pbvs 同款）
-        run_row = QHBoxLayout()
-        run_row.setSpacing(4)
+        # 主操作（整宽）+ 重置（ghost）
         self.btn_start = QPushButton("启动", nav)
         self.btn_start.setObjectName("btnPrimary")
+        self.btn_start.setCursor(Qt.PointingHandCursor)
+        lay.addWidget(self.btn_start)
+
+        self.btn_reset = QPushButton("重置", nav)
+        self.btn_reset.setObjectName("navAction")
+        self.btn_reset.setCursor(Qt.PointingHandCursor)
+        self.btn_reset.setIcon(ICONS.get("reset", palette(self._theme_name)["ink2"], 15))
+        self.btn_reset.clicked.connect(self._zero_pose)
+        lay.addWidget(self.btn_reset)
+
+        # 服务控制（停止 / 急停：不再挤在主按钮行）
+        ctl = QHBoxLayout()
+        ctl.setSpacing(4)
         self.btn_stop = QPushButton("停止", nav)
         self.btn_stop.setObjectName("btnDanger")
         self.btn_estop = QPushButton("急停", nav)
         self.btn_estop.setObjectName("btnEstop")
-        for b in (self.btn_start, self.btn_stop, self.btn_estop):
+        for b in (self.btn_stop, self.btn_estop):
             b.setCursor(Qt.PointingHandCursor)
-            run_row.addWidget(b, 1)
-        lay.addLayout(run_row)
+            ctl.addWidget(b, 1)
+        lay.addLayout(ctl)
 
-        # 导航分组
-        self.nav_items: list[QPushButton] = []
+        # 可折叠分组 + 图标导航行
+        self.nav_groups: list[tuple[NavGroupHeader, list[NavItem]]] = []
         lay.addWidget(self._nav_group("设备", [
             ("概览", "robot", 0), ("机器人", "target", 1), ("场景", "layers", 2)]))
         lay.addWidget(self._nav_group("控制", [
-            ("关节", "sliders", 3), ("规划", "target", 4)]))
+            ("关节", "sliders", 3), ("规划", "crosshair", 4)]))
         lay.addWidget(self._nav_group("诊断", [
             ("日志", "terminal", 5)]))
         lay.addStretch(1)
 
-        # 运行摘要卡
+        # 最近运行
+        hist_box = QWidget(nav)
+        hl = QVBoxLayout(hist_box)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(0)
+        self.hist_header = NavGroupHeader("最近运行", palette(self._theme_name), hist_box)
+        hl.addWidget(self.hist_header)
+        self.hist_body = QWidget(hist_box)
+        hbl = QVBoxLayout(self.hist_body)
+        hbl.setContentsMargins(0, 0, 0, 0)
+        hbl.setSpacing(0)
+        self.hist_rows: list[HistoryRow] = []
+        for title, rel in (("连接真机", "刚刚"), ("仿真运行", "3分"),
+                           ("规划 home", "1小时"), ("启动检查", "1天")):
+            row = HistoryRow(title, rel, self.hist_body)
+            hbl.addWidget(row)
+            self.hist_rows.append(row)
+        hl.addWidget(self.hist_body)
+        self.hist_header.toggled.connect(self.hist_body.setVisible)
+        lay.addWidget(hist_box)
+
+        # 运行摘要卡（key/value 行）
         recent = QFrame(nav)
         recent.setObjectName("navSummary")
         rl = QVBoxLayout(recent)
-        rl.setContentsMargins(10, 8, 10, 9)
-        rl.setSpacing(3)
-        lbl = QLabel("运行摘要", recent)
-        lbl.setObjectName("navSummaryTitle")
-        self.lbl_summary = QLabel("空闲 · 未连接", recent)
-        self.lbl_summary.setObjectName("navSummaryVal")
-        self.lbl_summary.setWordWrap(True)
-        rl.addWidget(lbl)
-        rl.addWidget(self.lbl_summary)
+        rl.setContentsMargins(11, 9, 11, 10)
+        rl.setSpacing(4)
+        sum_title = QLabel("运行摘要", recent)
+        sum_title.setObjectName("navSummaryTitle")
+        rl.addWidget(sum_title)
+        self.sum_rows: dict[str, QLabel] = {}
+        for key, init in (("状态", "就绪"), ("模式", "真机"), ("延迟", "—"),
+                          ("上次", "—")):
+            row = QWidget(recent)
+            rwl = QHBoxLayout(row)
+            rwl.setContentsMargins(0, 0, 0, 0)
+            rwl.setSpacing(8)
+            k = QLabel(key, row)
+            k.setObjectName("navSummaryKey")
+            v = QLabel(init, row)
+            v.setObjectName("navSummaryVal")
+            v.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            rwl.addWidget(k)
+            rwl.addStretch(1)
+            rwl.addWidget(v)
+            rl.addWidget(row)
+            self.sum_rows[key] = v
         lay.addWidget(recent)
 
-        # 底部：主题 + 状态
+        # 命令面板行
+        self.cmd_row = NavCommandRow(palette(self._theme_name), nav)
+        lay.addWidget(self.cmd_row)
+
+        # 页脚：主题分段 + 状态点 + 齿轮
         foot = QHBoxLayout()
         foot.setSpacing(6)
         self.sw_theme = ModeSwitch(["浅色", "深色"], nav, height=28)
         self.sw_theme.setCurrentIndex(1 if self._theme_name == "dark" else 0)
         self.sw_theme.currentIndexChanged.connect(
             lambda i: self._apply_theme("dark" if i == 1 else "light"))
-        self.lbl_status = QLabel("● 空闲", nav)
-        self.lbl_status.setObjectName("statusDot")
         foot.addWidget(self.sw_theme, 1)
-        foot.addWidget(self.lbl_status)
         lay.addLayout(foot)
+
+        foot2 = QHBoxLayout()
+        foot2.setSpacing(6)
+        self.status_dot = StatusDot(palette(self._theme_name), "就绪", nav)
+        foot2.addWidget(self.status_dot, 1)
+        self.btn_gear = QPushButton(nav)
+        self.btn_gear.setObjectName("navIconBtn")
+        self.btn_gear.setIcon(ICONS.get("sliders", palette(self._theme_name)["ink2"], 15))
+        self.btn_gear.setCursor(Qt.PointingHandCursor)
+        foot2.addWidget(self.btn_gear)
+        lay.addLayout(foot2)
         return nav
 
     def _nav_group(self, title: str, items: list[tuple[str, str, int]]) -> QWidget:
-        box = QWidget(nav := self)
+        pal = palette(self._theme_name)
+        box = QWidget(self)
         vl = QVBoxLayout(box)
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(1)
-        lbl = QLabel(title, box)
-        lbl.setObjectName("navGroupHeader")
-        vl.addWidget(lbl)
+        header = NavGroupHeader(title, pal, box)
+        vl.addWidget(header)
+        body = QWidget(box)
+        bl = QVBoxLayout(body)
+        bl.setContentsMargins(0, 0, 0, 2)
+        bl.setSpacing(1)
+        rows: list[NavItem] = []
         for text, icon_name, page in items:
-            b = QPushButton(text, box)
-            b.setObjectName("navItem")
-            b.setCheckable(True)
-            b.setCursor(Qt.PointingHandCursor)
-            b.setProperty("page", page)
-            b.setProperty("iconName", icon_name)
-            b.clicked.connect(lambda _=False, p=page: self._goto_page(p))
-            self.nav_items.append(b)
-            vl.addWidget(b)
+            item = NavItem(text, icon_name, page, body)
+            item.set_icon_color(pal["ink2"])
+            item.clicked.connect(lambda _=False, p=page: self._goto_page(p))
+            bl.addWidget(item)
+            rows.append(item)
+            self.nav_items.append(item)
+        vl.addWidget(body)
+        header.toggled.connect(body.setVisible)
+        self.nav_groups.append((header, rows))
         return box
+
+    def _toggle_nav(self) -> None:
+        collapsed = self.nav.width() > SIDE_COLLAPSED_W + 8
+        w = SIDE_COLLAPSED_W if collapsed else SIDE_W
+        self.nav.setMinimumWidth(w)
+        self.nav.setMaximumWidth(w)
+        for item in self.nav_items:
+            item.setText("" if collapsed else f"  {item._label}")  # noqa: SLF001
+            item.setToolTip(item._label if collapsed else "")      # noqa: SLF001
 
     # ── Inspector ─────────────────────────────────────
     def _build_inspector(self) -> QFrame:
@@ -385,6 +470,7 @@ class StudioWindow(QMainWindow):
         vl = QVBoxLayout(page)
         vl.setContentsMargins(0, 8, 0, 0)
         vl.setSpacing(8)
+        pal = self._pal_now
 
         card = GroupCard("运行状态", page)
         self.row_mode = Row("模式", value=True)
@@ -392,8 +478,11 @@ class StudioWindow(QMainWindow):
         self.row_ctrl = Row("控制器", value=False)
         self.row_rate = Row("状态频率", value=False)
         card.add(self.row_mode)
+        card.add(GroupRule(card))
         card.add(self.row_link)
+        card.add(GroupRule(card))
         card.add(self.row_ctrl)
+        card.add(GroupRule(card))
         card.add(self.row_rate)
         vl.addWidget(card)
 
@@ -401,14 +490,13 @@ class StudioWindow(QMainWindow):
         self.btn_check = QPushButton("启动前检查", card2)
         self.btn_check.setCursor(Qt.PointingHandCursor)
         self.btn_check.clicked.connect(self._on_precheck)
+        card2.add(self.btn_check)
         hint = QLabel("启动会让硬件执行回零：所有关节被驱动到 0。"
                       "任一关节偏离零位超过 0.1 rad 时先手动摆正。", card2)
         hint.setObjectName("hintText")
         hint.setWordWrap(True)
-        card2.add(self.btn_check)
         card2.add(hint)
         vl.addWidget(card2)
-
         vl.addStretch(1)
         return page
 
@@ -445,9 +533,7 @@ class StudioWindow(QMainWindow):
         row = QHBoxLayout()
         row.setSpacing(4)
         for key, text in (("home", "复位"), ("front", "前"), ("side", "侧"), ("top", "顶")):
-            b = QPushButton(text, card)
-            b.setObjectName("chip")
-            b.setCursor(Qt.PointingHandCursor)
+            b = ToolChip(text, card)
             b.clicked.connect(lambda _=False, k=key: self.view.set_view_preset(k))
             row.addWidget(b, 1)
         holder = QWidget(card)
@@ -455,30 +541,17 @@ class StudioWindow(QMainWindow):
         card.add(holder)
         vl.addWidget(card)
 
-        card2 = GroupCard("叠加", page)
-        self.btn_wire = QPushButton("线框", card2)
-        self.btn_wire.setObjectName("chip")
-        self.btn_wire.setCheckable(True)
-        self.btn_wire.setCursor(Qt.PointingHandCursor)
-        self.btn_wire.toggled.connect(lambda on: self.view.set_overlay("wireframe", on))
-        self.btn_col = QPushButton("碰撞体", card2)
-        self.btn_col.setObjectName("chip")
-        self.btn_col.setCheckable(True)
-        self.btn_col.setCursor(Qt.PointingHandCursor)
-        self.btn_col.toggled.connect(lambda on: self.view.set_overlay("collision", on))
-        self.btn_trans = QPushButton("半透明", card2)
-        self.btn_trans.setObjectName("chip")
-        self.btn_trans.setCheckable(True)
-        self.btn_trans.setCursor(Qt.PointingHandCursor)
-        self.btn_trans.toggled.connect(lambda on: self.view.set_overlay("transparent", on))
-        overlay_row = QHBoxLayout()
-        overlay_row.setSpacing(4)
-        holder2 = QWidget(card2)
-        holder2.setLayout(overlay_row)
-        overlay_row.addWidget(self.btn_wire, 1)
-        overlay_row.addWidget(self.btn_col, 1)
-        overlay_row.addWidget(self.btn_trans, 1)
-        card2.add(holder2)
+        card2 = GroupCard("显示", page)
+        for label, desc, key, on in (
+            ("线框", "只看网格骨架", "wireframe", False),
+            ("碰撞体", "显示碰撞包围几何", "collision", False),
+            ("半透明", "看穿本体内部结构", "transparent", False),
+        ):
+            sw = Switch(self._pal_now, on, card2)
+            sw.toggled.connect(lambda v, k=key: self.view.set_overlay(k, v))
+            self._switches.append(sw)
+            card2.add(SettingsRow(label, sw, desc, card2))
+            card2.add(GroupRule(card2))
         vl.addWidget(card2)
         vl.addStretch(1)
         return page
@@ -615,6 +688,9 @@ class StudioWindow(QMainWindow):
 
         self.tabs = QTabWidget(host)
         self.tabs.setDocumentMode(True)
+        bar = AnimatedTabBar(self.tabs)
+        self._tabbars.append(bar)
+        self.tabs.setTabBar(bar)
         self.tabs.addTab(self._build_joint_table(host), "关节")
         self.tabs.addTab(self._build_log_tab(host), "日志")
         lay.addWidget(self.tabs, 1)
@@ -694,6 +770,29 @@ class StudioWindow(QMainWindow):
         self.view = MujocoViewPanel(frame)
         flay.addWidget(self.view)
         lay.addWidget(frame, 1)
+
+        # 底部工具条（pbvs 同款：视角 | 显示 | 叠加）
+        bar = QHBoxLayout()
+        bar.setContentsMargins(6, 0, 6, 0)
+        bar.setSpacing(3)
+        lbl = QLabel("视角", card)
+        lbl.setObjectName("toolLabel")
+        bar.addWidget(lbl)
+        for key, text in (("home", "复位"), ("front", "前"), ("side", "侧"), ("top", "顶")):
+            b = ToolChip(text, card)
+            b.clicked.connect(lambda _=False, k=key: self.view.set_view_preset(k))
+            bar.addWidget(b)
+        bar.addStretch(1)
+        self.btn_wire_q = ToolChip("线框", card, checkable=True)
+        self.btn_wire_q.toggled.connect(lambda on: self.view.set_overlay("wireframe", on))
+        self.btn_col_q = ToolChip("碰撞体", card, checkable=True)
+        self.btn_col_q.toggled.connect(lambda on: self.view.set_overlay("collision", on))
+        lbl2 = QLabel("显示", card)
+        lbl2.setObjectName("toolLabel")
+        bar.addWidget(lbl2)
+        bar.addWidget(self.btn_wire_q)
+        bar.addWidget(self.btn_col_q)
+        lay.addLayout(bar)
 
         self.joint_overlay = JointOverlay(self._joint_provider, palette(self._theme_name), self.view)
         self.joint_overlay.move(10, 10)
@@ -795,7 +894,7 @@ class StudioWindow(QMainWindow):
     def _goto_page(self, page: int) -> None:
         self.pages.setCurrentIndex(page)
         for b in self.nav_items:
-            b.setChecked(b.property("page") == page)
+            b.setChecked(b.page_index == page)
         title, desc = self._PAGE_META[page]
         self.insp_title.setText(title)
         self.insp_desc.setText(desc)
@@ -806,11 +905,26 @@ class StudioWindow(QMainWindow):
     def _apply_theme(self, name: str, animate: bool = True) -> None:
         self._theme_name = name
         pal = palette(name)
+        self._pal_now = pal
         self.setStyleSheet(build_qss(pal))
         ICONS.clear()
         self.win_btns.apply_palette(pal)
         self.view.apply_theme(pal)
         self.joint_overlay.apply_palette(pal)
+        # 自绘组件要单独喂配色（QSS 管不到 QPainter）
+        self.logo.set_palette_colors(pal)
+        self.status_dot.set_palette_colors(pal)
+        self.cmd_row.set_palette_colors(pal)
+        self.btn_gear.setIcon(ICONS.get("sliders", pal["ink2"], 15))
+        self.btn_reset.setIcon(ICONS.get("reset", pal["ink2"], 15))
+        for header, rows in self.nav_groups:
+            header.set_palette_colors(pal)
+            for item in rows:
+                item.set_icon_color(pal["ink2"])
+        for sw in getattr(self, "_switches", []):
+            sw.set_palette_colors(pal)
+        for tabbar in getattr(self, "_tabbars", []):
+            tabbar.set_palette_colors(pal)
         self.setProperty("theme", name)
         if self._worker:
             self._worker.set_theme(name)
@@ -893,26 +1007,28 @@ class StudioWindow(QMainWindow):
             lbl.setText(f"{pose.get(name, 0.0):+.3f}")
 
         if sim:
-            self.lbl_status.setText("● 仿真运行中")
+            self.status_dot.set_state(self._pal_now["accent"], "仿真运行中", breathe=True)
             self.chip_src.setText("仿真")
             self.row_link.set_value("MuJoCo 物理")
             self.row_rate.set_value("200 Hz 物理")
         elif following:
             rate = self.bridge.rate if self.bridge else 0.0
-            self.lbl_status.setText("● 真机在线")
+            self.status_dot.set_state(self._pal_now["success"], "真机在线", breathe=False)
             self.chip_src.setText("真机")
             self.row_link.set_value("已连接")
             self.row_rate.set_value(f"{rate:.0f} Hz")
         else:
-            self.lbl_status.setText("● 3D 运行中")
+            self.status_dot.set_state(self._pal_now["warn"], "3D 运行中", breathe=False)
             self.chip_src.setText("未连接")
             self.row_link.set_value("未连接")
             self.row_rate.set_value("--")
         self.row_mode.set_value("仿真" if sim else "真机")
-        self.lbl_summary.setText(
-            f"{'仿真' if sim else '真机'} · "
-            f"{'物理仿真' if sim else ('跟随真机' if following else '本地姿态')} · "
-            f"3D {self.view.frame_count} 帧")
+        self.sum_rows["状态"].setText(
+            "仿真" if sim else ("跟随真机" if following else "本地姿态"))
+        self.sum_rows["模式"].setText("仿真" if sim else "真机")
+        self.sum_rows["延迟"].setText(
+            f"{self.bridge.rate:.0f}Hz" if following and self.bridge else "—")
+        self.sum_rows["上次"].setText(f"{self.view.frame_count}帧")
 
     # ── 日志 ─────────────────────────────────────────
     def _append_log(self, text: str) -> None:
