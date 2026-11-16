@@ -25,6 +25,9 @@ from ..core.mjview import MjEmbedRenderer
 from ..core.sim import SimBackend
 from ..model import scene as model_scene
 from ..ros.bridge import JointStatePublisher, RosBridge
+from ..ros.control import GRIP_CLOSED, GRIP_OPEN, ControlClient
+from ..ros.moveit_client import GROUP_JOINTS, GROUPS, FALLBACK_STATES, MoveItClient
+from ..ros.stack import StackManager
 from .chrome import DragHandle, ResizeHandles, WindowButtons
 from .icons import ICONS
 from .joint_monitor import JointOverlay
@@ -176,6 +179,11 @@ class StudioWindow(QMainWindow):
         self._switches: list[Switch] = []
         self._tabbars: list[AnimatedTabBar] = []
         self._pal_now = palette(theme_name)
+        self._moveit: MoveItClient | None = None
+        self._control: ControlClient | None = None
+        self._stack = StackManager(on_log=lambda m: self.log_sig.emit(m))
+        self._named_states: dict[str, dict[str, list[float]]] = \
+            {g: dict(v) for g, v in FALLBACK_STATES.items()}
 
         self.setWindowTitle("OpenArm Studio")
         self.resize(1560, 960)
@@ -200,6 +208,11 @@ class StudioWindow(QMainWindow):
         self._pub_timer.setInterval(20)
         self._pub_timer.timeout.connect(self._publish_sim_state)
         self._pub_timer.start()
+        # 控制器状态轮询（2s，走 controller_manager 服务）
+        self._ctrl_timer = QTimer(self)
+        self._ctrl_timer.setInterval(2000)
+        self._ctrl_timer.timeout.connect(self._poll_controllers)
+        self._ctrl_timer.start()
 
     # ── 构建 ──────────────────────────────────────────
     def _build_ui(self) -> None:
@@ -302,7 +315,7 @@ class StudioWindow(QMainWindow):
         self.btn_reset.setObjectName("navAction")
         self.btn_reset.setCursor(Qt.PointingHandCursor)
         self.btn_reset.setIcon(ICONS.get("reset", palette(self._theme_name)["ink2"], 15))
-        self.btn_reset.clicked.connect(self._zero_pose)
+        self.btn_reset.clicked.connect(self._on_reset)
         lay.addWidget(self.btn_reset)
 
         # 服务控制（停止 / 急停：不再挤在主按钮行）
@@ -327,23 +340,36 @@ class StudioWindow(QMainWindow):
             ("日志", "terminal", 5)]))
         lay.addStretch(1)
 
-        # 最近运行
+        # 控制器状态（真实数据，来自 controller_manager）
         hist_box = QWidget(nav)
         hl = QVBoxLayout(hist_box)
         hl.setContentsMargins(0, 0, 0, 0)
         hl.setSpacing(0)
-        self.hist_header = NavGroupHeader("最近运行", palette(self._theme_name), hist_box)
+        self.hist_header = NavGroupHeader("控制器", palette(self._theme_name), hist_box)
         hl.addWidget(self.hist_header)
         self.hist_body = QWidget(hist_box)
         hbl = QVBoxLayout(self.hist_body)
         hbl.setContentsMargins(0, 0, 0, 0)
         hbl.setSpacing(0)
-        self.hist_rows: list[HistoryRow] = []
-        for title, rel in (("连接真机", "刚刚"), ("仿真运行", "3分"),
-                           ("规划 home", "1小时"), ("启动检查", "1天")):
-            row = HistoryRow(title, rel, self.hist_body)
+        self.ctrl_rows: dict[str, QLabel] = {}
+        for cname in ("left_joint_trajectory_controller", "right_joint_trajectory_controller",
+                      "left_gripper_controller", "right_gripper_controller"):
+            short = cname.replace("_joint_trajectory", "").replace("_controller", "")
+            row = QWidget(self.hist_body)
+            rl = QHBoxLayout(row)
+            rl.setContentsMargins(10, 0, 6, 0)
+            rl.setSpacing(6)
+            k = QLabel(short, row)
+            k.setObjectName("historyTitle")
+            v = QLabel("—", row)
+            v.setObjectName("historyTime")
+            v.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            rl.addWidget(k)
+            rl.addStretch(1)
+            rl.addWidget(v)
+            row.setFixedHeight(26)
             hbl.addWidget(row)
-            self.hist_rows.append(row)
+            self.ctrl_rows[cname] = v
         hl.addWidget(self.hist_body)
         self.hist_header.toggled.connect(self.hist_body.setVisible)
         lay.addWidget(hist_box)
@@ -528,10 +554,24 @@ class StudioWindow(QMainWindow):
         card.add(self.row_moveit)
         vl.addWidget(card)
 
-        card2 = GroupCard("机器人", page)
-        card2.add(Row("型号  OpenArm v10", value=True))
-        card2.add(Row("自由度  7 × 2", value=True))
-        card2.add(Row("夹爪  0.000 – 0.044 m", value=True))
+        card2 = GroupCard("夹爪", page)
+        grow = QHBoxLayout()
+        grow.setSpacing(4)
+        self.btn_grip_l_open = QPushButton("左开", card2)
+        self.btn_grip_l_close = QPushButton("左合", card2)
+        self.btn_grip_r_open = QPushButton("右开", card2)
+        self.btn_grip_r_close = QPushButton("右合", card2)
+        gholder = QWidget(card2)
+        gholder.setLayout(grow)
+        for b in (self.btn_grip_l_open, self.btn_grip_l_close,
+                  self.btn_grip_r_open, self.btn_grip_r_close):
+            b.setCursor(Qt.PointingHandCursor)
+            grow.addWidget(b, 1)
+        self.btn_grip_l_open.clicked.connect(lambda: self._on_gripper("left", True))
+        self.btn_grip_l_close.clicked.connect(lambda: self._on_gripper("left", False))
+        self.btn_grip_r_open.clicked.connect(lambda: self._on_gripper("right", True))
+        self.btn_grip_r_close.clicked.connect(lambda: self._on_gripper("right", False))
+        card2.add(gholder)
         vl.addWidget(card2)
         vl.addStretch(1)
         return page
@@ -610,34 +650,125 @@ class StudioWindow(QMainWindow):
         vl.setContentsMargins(0, 8, 0, 0)
         vl.setSpacing(8)
 
-        card = GroupCard("MoveIt 规划", page)
+        # 目标：规划组 + 命名状态
+        card = GroupCard("目标", page)
         self.combo_group = QComboBox(card)
-        self.combo_group.addItems(["left_arm", "right_arm", "left_gripper", "right_gripper"])
-        card.add(self.combo_group)
-        self.combo_named = QComboBox(card)
-        self.combo_named.addItems(["（选择命名状态）", "home", "hands_up", "open", "closed"])
-        card.add(self.combo_named)
+        self.combo_group.addItems(["left_arm", "right_arm",
+                                   "left_gripper", "right_gripper"])
+        self.combo_group.currentTextChanged.connect(self._on_group_changed)
+        card.add(SettingsRow("规划组", self.combo_group, "", card))
+        card.add(GroupRule(card))
 
+        self.combo_named = QComboBox(card)
+        card.add(SettingsRow("命名状态", self.combo_named, "", card))
+        card.add(GroupRule(card))
+
+        self.spin_vel = QComboBox(card)
+        for pct in ("5%", "10%", "25%", "50%", "100%"):
+            self.spin_vel.addItem(pct)
+        self.spin_vel.setCurrentIndex(1)
+        card.add(SettingsRow("速度", self.spin_vel, "", card))
+        vl.addWidget(card)
+
+        # 关节目标（选中规划组后按关节数生成）
+        card2 = GroupCard("关节目标", page)
+        self._goal_host = QWidget(card2)
+        self._goal_layout = QVBoxLayout(self._goal_host)
+        self._goal_layout.setContentsMargins(0, 0, 0, 0)
+        self._goal_layout.setSpacing(6)
+        card2.add(self._goal_host)
+        vl.addWidget(card2)
+
+        # 规划 / 执行
+        card3 = GroupCard("规划执行", page)
         row = QHBoxLayout()
-        row.setSpacing(4)
-        self.btn_plan = QPushButton("规划", card)
+        row.setSpacing(6)
+        self.btn_plan = QPushButton("规划预览", card3)
         self.btn_plan.setCursor(Qt.PointingHandCursor)
-        self.btn_exec = QPushButton("执行", card)
-        self.btn_exec.setObjectName("primary")
+        self.btn_plan.clicked.connect(lambda: self._do_plan(execute=False))
+        self.btn_exec = QPushButton("规划并执行", card3)
+        self.btn_exec.setObjectName("btnPrimary")
         self.btn_exec.setCursor(Qt.PointingHandCursor)
-        holder = QWidget(card)
+        self.btn_exec.clicked.connect(lambda: self._do_plan(execute=True))
+        holder = QWidget(card3)
         holder.setLayout(row)
         row.addWidget(self.btn_plan, 1)
         row.addWidget(self.btn_exec, 1)
-        card.add(holder)
-
-        self.lbl_plan = QLabel("MoveIt 未就绪（P4 阶段接入 /move_action）", card)
+        card3.add(holder)
+        self.lbl_plan = QLabel("MoveIt 未就绪（需先启动真机栈）", card3)
         self.lbl_plan.setObjectName("hintText")
         self.lbl_plan.setWordWrap(True)
-        card.add(self.lbl_plan)
-        vl.addWidget(card)
+        card3.add(self.lbl_plan)
+        vl.addWidget(card3)
         vl.addStretch(1)
+
+        self._goal_sliders: list[tuple[QSlider, QLabel]] = []
+        self._on_group_changed(self.combo_group.currentText())
         return page
+
+    def _on_group_changed(self, group: str) -> None:
+        while self._goal_layout.count():
+            it = self._goal_layout.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        self._goal_sliders.clear()
+        joints = GROUP_JOINTS.get(group, [])
+        states = sorted(self._named_states.get(group, {}).keys())
+        self.combo_named.blockSignals(True)
+        self.combo_named.clear()
+        self.combo_named.addItems(states)
+        self.combo_named.blockSignals(False)
+        for i, name in enumerate(joints):
+            row = QWidget(self._goal_host)
+            rl = QVBoxLayout(row)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.setSpacing(1)
+            top = QHBoxLayout()
+            lbl = QLabel(f"J{i + 1}" if "joint" in name else "夹爪", row)
+            lbl.setObjectName("jointName")
+            val = QLabel("0.000", row)
+            val.setObjectName("jointVal")
+            val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            top.addWidget(lbl)
+            top.addStretch(1)
+            top.addWidget(val)
+            s = QSlider(Qt.Horizontal, row)
+            if "finger" in name:
+                s.setRange(0, 44)
+            else:
+                s.setRange(-314, 314)
+            s.valueChanged.connect(
+                lambda v, lab=val, fing="finger" in name:
+                lab.setText(f"{v / 1000:.3f}" if fing else f"{v / 100:+.3f}"))
+            rl.addLayout(top)
+            rl.addWidget(s)
+            self._goal_layout.addWidget(row)
+            self._goal_sliders.append((s, val))
+
+    def _goal_values(self) -> list[float]:
+        out = []
+        for i, (s, _v) in enumerate(self._goal_sliders):
+            fing = "finger" in GROUP_JOINTS[self.combo_group.currentText()][i]
+            out.append(s.value() / 1000.0 if fing else s.value() / 100.0)
+        return out
+
+    def _do_plan(self, execute: bool) -> None:
+        mc = self._moveit
+        if mc is None:
+            self._log("MoveIt 客户端未初始化")
+            return
+        group = self.combo_group.currentText()
+        vel = float(self.spin_vel.currentText().rstrip("%")) / 100.0
+        state = self.combo_named.currentText()
+        if state and not execute:
+            self._log(f"按关节滑块目标规划（{group}，速度 {vel:.0%}）")
+
+        def done(ok: bool, text: str) -> None:
+            self.log_sig.emit(("✓ " if ok else "✗ ") + text)
+            self.lbl_plan.setText(text)
+
+        mc.plan_joint(group, self._goal_values(), done,
+                      execute=execute, vel=vel, acc=vel)
 
     def _page_log(self) -> QWidget:
         page = QWidget(self)
@@ -955,8 +1086,82 @@ class StudioWindow(QMainWindow):
         """只读订阅 /joint_states；失败不影响 3D（此时用本地姿态）。"""
         self.bridge = RosBridge(on_log=lambda m: self.log_sig.emit(m))
         if self.bridge.start() and self.bridge._node is not None:  # noqa: SLF001
-            self.js_pub = JointStatePublisher(self.bridge._node)  # noqa: SLF001
-            self._log("仿真状态发布器就绪（仅仿真模式使用）")
+            node = self.bridge._node  # noqa: SLF001
+            self.js_pub = JointStatePublisher(node)
+            self._control = ControlClient(node, on_log=lambda m: self.log_sig.emit(m))
+            self._moveit = MoveItClient(node, on_log=lambda m: self.log_sig.emit(m))
+            self._named_states = self._moveit.named_states
+            self._log("仿真状态发布器 + 控制器/MoveIt 客户端就绪")
+            # 命名状态可能从 SRDF 读到了，刷新规划页下拉
+            self._on_group_changed(self.combo_group.currentText())
+            self._bind_actions()
+
+    # ── 真实动作绑定 ──────────────────────────────────
+    def _bind_actions(self) -> None:
+        self.btn_start.clicked.connect(self._on_start)
+        self.btn_stop.clicked.connect(self._on_stop)
+        self.btn_estop.clicked.connect(self._on_estop)
+        self.btn_gear.clicked.connect(lambda: self._goto_page(1))
+
+    def _on_start(self) -> None:
+        self._log("启动真机栈…")
+        fake = self._is_sim
+        ok = self._stack.start(fake=fake)
+        if ok:
+            self.sum_rows["状态"].setText("启动中…")
+        else:
+            self.sum_rows["状态"].setText("启动失败")
+
+    def _on_stop(self) -> None:
+        self._log("停止真机栈…")
+        self._stack.stop()
+        self.sum_rows["状态"].setText("已停止")
+
+    def _on_estop(self) -> None:
+        if self._control is None:
+            self._log("急停：控制器客户端未就绪")
+            return
+        ok = self._control.emergency_stop()
+        self._log("急停已下发（控制器全部停止 → 电机失能）" if ok
+                  else "急停下发失败——请立刻手动断电！")
+        self.sum_rows["状态"].setText("急停" if ok else "急停失败")
+
+    def _on_reset(self) -> None:
+        """重置：孪生/仿真归零；真机在线则规划双臂 home 并执行。"""
+        self._zero_pose()
+        mc = self._moveit
+        if mc is None or self._is_sim or not (self.bridge and self.bridge.connected):
+            return
+        self._log("重置：规划双臂 home…")
+
+        def done(ok: bool, text: str) -> None:
+            self.log_sig.emit(("✓ " if ok else "✗ ") + "左臂 home：" + text)
+
+        mc.plan_named("left_arm", "home", done, execute=True, vel=0.1, acc=0.1)
+
+        def done2(ok: bool, text: str) -> None:
+            self.log_sig.emit(("✓ " if ok else "✗ ") + "右臂 home：" + text)
+
+        mc.plan_named("right_arm", "home", done2, execute=True, vel=0.1, acc=0.1)
+
+    def _poll_controllers(self) -> None:
+        """每 2 秒拉一次控制器状态（真实数据）。"""
+        ctl = self._control
+        if ctl is None or not ctl.managers_ready():
+            for lbl in getattr(self, "ctrl_rows", {}).values():
+                lbl.setText("—")
+            return
+        rows = ctl.list_controllers()
+        state = {n: s for n, _t, s in rows}
+        for cname, lbl in self.ctrl_rows.items():
+            lbl.setText(state.get(cname, "未加载"))
+
+    def _on_gripper(self, side: str, open_it: bool) -> None:
+        if self._control is None:
+            self._log("夹爪：控制器客户端未就绪")
+            return
+        self._control.gripper(side, GRIP_OPEN if open_it else GRIP_CLOSED,
+                              done_cb=lambda ok, txt: self.log_sig.emit(txt))
     @property
     def _is_sim(self) -> bool:
         return self.sw_mode.currentIndex() == 1
