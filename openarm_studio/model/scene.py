@@ -59,11 +59,16 @@ def _apply_finishes(xml: str) -> str:
         key = f"mat_c{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}"
         if key not in mat_names:
             r, g, b = (v / 255.0 for v in rgb)
-            bright = (r + g + b) / 3.0 > 0.45
-            if bright:  # 银色金属件
+            mean = (r + g + b) / 3.0
+            if mean > 0.45:
+                # 银色机加件：金属高光
                 spec, shin, metal, rough = 0.85, 0.6, 1.0, 0.35
-            else:       # 3D 打印 / 电机：哑光深色
-                spec, shin, metal, rough = 0.08, 0.1, 0.0, 0.9
+            elif mean > 0.15:
+                # 3D 打印塑料件（灰黑 63）：半哑光，留塑料的柔和高光
+                spec, shin, metal, rough = 0.35, 0.45, 0.0, 0.55
+            else:
+                # 电机/深色件（24/0）：硬质光泽，比打印件亮一档
+                spec, shin, metal, rough = 0.30, 0.5, 0.1, 0.45
             if key not in seen_mats:
                 mats_xml.append(
                     f'<material name="{key}" rgba="{r:.3f} {g:.3f} {b:.3f} 1" '
