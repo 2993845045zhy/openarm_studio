@@ -72,6 +72,9 @@ class MoveItClient:
         self._busy = False
         self._lock = threading.Lock()
         self.last_result: str = ""
+        # 最近一次规划结果，供 3D 预览播放
+        self.last_trajectory: list[list[float]] = []
+        self.last_joint_names: list[str] = []
 
     # ── 可用性 ────────────────────────────────────────
     def ready(self, timeout: float = 0.4) -> bool:
@@ -187,7 +190,10 @@ class MoveItClient:
         r = res.result
         ok = code == GoalStatus.STATUS_SUCCEEDED
         if ok:
-            n = len(r.planned_trajectory.joint_trajectory.points)
+            jt = r.planned_trajectory.joint_trajectory
+            self.last_joint_names = list(jt.joint_names)
+            self.last_trajectory = [list(pt.positions) for pt in jt.points]
+            n = len(jt.points)
             dur = 0.0
             if n:
                 pts = r.planned_trajectory.joint_trajectory.points[-1]

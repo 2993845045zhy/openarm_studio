@@ -68,6 +68,10 @@ class RenderWorker(threading.Thread):
         self.data: mujoco.MjData | None = None
         self.sim: SimBackend | None = None
         self._qmap: dict[str, int] = {}
+        # 轨迹播放（MoveIt 规划结果的 3D 预览）
+        self._traj: list[dict[str, float]] = []
+        self._traj_i = 0
+        self._traj_hold = 0.0
 
     # ── 外部接口（线程安全）────────────────────────────
     def set_pose(self, positions: dict[str, float]) -> None:
@@ -82,6 +86,22 @@ class RenderWorker(threading.Thread):
     def positions(self) -> dict[str, float]:
         with self._lock:
             return dict(self._latest)
+
+    def play_trajectory(self, names: list[str], points: list[list[float]],
+                        speed: float = 0.5) -> None:
+        """把规划轨迹转成「关节名→角度」序列，交给渲染循环逐帧播放。"""
+        frames = []
+        for p in points:
+            frames.append({n: float(v) for n, v in zip(names, p)})
+        with self._lock:
+            self._traj = frames
+            self._traj_i = 0
+            self._traj_hold = 0.0
+        self._speed = max(0.1, float(speed))
+
+    def stop_trajectory(self) -> None:
+        with self._lock:
+            self._traj = []
 
     def set_theme(self, theme_name: str) -> None:
         with self._lock:
@@ -124,6 +144,18 @@ class RenderWorker(threading.Thread):
                     pending_sync = self._pending_sync
                     self._pending_sync = False
                 assert self.model is not None and self.data is not None
+
+                # 轨迹预览优先：逐帧喂姿态（不跑物理）
+                with self._lock:
+                    traj = self._traj
+                    ti = self._traj_i
+                if traj and ti < len(traj):
+                    pose = traj[ti]
+                    with self._lock:
+                        self._traj_i = ti + 1
+                        self._pose = dict(pose)
+                        self._latest = dict(pose)
+                    mode = "twin"
 
                 if mode == "sim" and self.sim is not None:
                     if pending_sync:
@@ -792,6 +824,12 @@ class StudioWindow(QMainWindow):
         def done(ok: bool, text: str) -> None:
             self.log_sig.emit(("✓ " if ok else "✗ ") + text)
             self.lbl_plan.setText(text)
+            if ok and mc.last_trajectory and self._worker is not None:
+                # 3D 里播一遍规划轨迹（不动机器人），等同 RViz 的绿色路径预览
+                self._worker.play_trajectory(mc.last_joint_names,
+                                             mc.last_trajectory, speed=0.5)
+                self.log_sig.emit(
+                    f"3D 预览：{len(mc.last_trajectory)} 帧轨迹动画")
             if not ok or not chained["pending"]:
                 return
             chained["pending"] = False
