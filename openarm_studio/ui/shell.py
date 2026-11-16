@@ -24,10 +24,7 @@ from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout, Q
 from ..core.mjview import MjEmbedRenderer
 from ..core.sim import SimBackend
 from ..model import scene as model_scene
-from ..ros.bridge import JointStatePublisher, RosBridge
-from ..ros.control import GRIP_CLOSED, GRIP_OPEN, ControlClient
-from ..ros.moveit_client import GROUP_JOINTS, GROUPS, FALLBACK_STATES, MoveItClient
-from ..ros.stack import StackManager
+from ..backend.sdk_arm import GRIP_OPEN, SdkArm
 from .chrome import DragHandle, ResizeHandles, WindowButtons
 from .icons import ICONS
 from .joint_monitor import JointOverlay
@@ -219,21 +216,16 @@ class StudioWindow(QMainWindow):
         self._theme_name = theme_name
         self._reduced = False
         self._worker: RenderWorker | None = None
-        self.bridge: RosBridge | None = None
-        self.js_pub: JointStatePublisher | None = None
+        # SDK 直连双臂：left→can1, right→can0（与 bringup 约定一致）
+        self.arms: dict[str, SdkArm] = {}
+        self._cmd_rate_hz = 50.0     # 滑块下发频率
         self._local_pose: dict[str, float] = {}
         self.nav_items: list[NavItem] = []
         self._switches: list[Switch] = []
         self._tabbars: list[AnimatedTabBar] = []
         self._pal_now = palette(theme_name)
-        self._moveit: MoveItClient | None = None
-        self._control: ControlClient | None = None
-        self._stack = StackManager(on_log=lambda m: self.log_sig.emit(m))
-        self._named_states: dict[str, dict[str, list[float]]] = \
-            {g: dict(v) for g, v in FALLBACK_STATES.items()}
         self._conn_state = "disconnected"
-        self._wait_timer = None
-        self._wait_t0 = 0.0
+        self._cmd_pose: dict[str, float] = {}
 
         self.setWindowTitle("OpenArm Studio")
         self.resize(1560, 960)
@@ -375,7 +367,7 @@ class StudioWindow(QMainWindow):
         lay.addWidget(self._nav_group("设备", [
             ("概览", "robot", 0), ("机器人", "target", 1), ("场景", "layers", 2)]))
         lay.addWidget(self._nav_group("控制", [
-            ("关节", "sliders", 3), ("规划", "crosshair", 4)]))
+            ("关节", "sliders", 3)]))
         lay.addWidget(self._nav_group("诊断", [
             ("日志", "terminal", 5)]))
         lay.addStretch(1)
@@ -516,7 +508,6 @@ class StudioWindow(QMainWindow):
         self.pages.addTab(self._page_robot(), "机器人")
         self.pages.addTab(self._page_scene(), "场景")
         self.pages.addTab(self._page_joints(), "关节")
-        self.pages.addTab(self._page_plan(), "规划")
         self.pages.addTab(self._page_log(), "日志")
         lay.addWidget(self.pages, 1)
         return insp
@@ -576,10 +567,8 @@ class StudioWindow(QMainWindow):
         card = GroupCard("接口", page)
         self.row_topic = Row("关节话题", value=False)
         self.row_ctrl_ns = Row("控制器", value=False)
-        self.row_moveit = Row("MoveIt", value=False)
         card.add(self.row_topic)
         card.add(self.row_ctrl_ns)
-        card.add(self.row_moveit)
         vl.addWidget(card)
 
         card2 = GroupCard("夹爪", page)
@@ -672,202 +661,12 @@ class StudioWindow(QMainWindow):
         vl.addStretch(1)
         return page
 
-    def _page_plan(self) -> QWidget:
-        page = QWidget(self)
-        vl = QVBoxLayout(page)
-        vl.setContentsMargins(0, 8, 0, 0)
-        vl.setSpacing(8)
-
-        # 目标：规划组 + 命名状态
-        card = GroupCard("目标", page)
-        self.combo_group = QComboBox(card)
-        self.combo_group.addItems(["left_arm", "right_arm",
-                                   "left_gripper", "right_gripper"])
-        self.combo_group.currentTextChanged.connect(self._on_group_changed)
-        card.add(SettingsRow("规划组", self.combo_group, "", card))
-        card.add(GroupRule(card))
-
-        self.combo_named = QComboBox(card)
-        card.add(SettingsRow("命名状态", self.combo_named, "", card))
-        card.add(GroupRule(card))
-
-        self.spin_vel = QComboBox(card)
-        for pct in ("5%", "10%", "25%", "50%", "100%"):
-            self.spin_vel.addItem(pct)
-        self.spin_vel.setCurrentIndex(1)
-        card.add(SettingsRow("速度", self.spin_vel, "", card))
-        card.add(GroupRule(card))
-
-        self.combo_planner = QComboBox(card)
-        self.combo_planner.addItems(
-            ["RRTConnect", "RRT", "RRTstar", "PRM", "PRMstar", "EST", "LBKPIECE"])
-        card.add(SettingsRow("规划器", self.combo_planner, "", card))
-        card.add(GroupRule(card))
-
-        self.spin_time = QDoubleSpinBox(card)
-        self.spin_time.setRange(0.5, 30.0)
-        self.spin_time.setSingleStep(0.5)
-        self.spin_time.setValue(5.0)
-        self.spin_time.setSuffix(" s")
-        card.add(SettingsRow("规划时间", self.spin_time, "", card))
-        card.add(GroupRule(card))
-
-        self.spin_attempts = QSpinBox(card)
-        self.spin_attempts.setRange(1, 50)
-        self.spin_attempts.setValue(10)
-        card.add(SettingsRow("尝试次数", self.spin_attempts, "", card))
-        vl.addWidget(card)
-
-        # 关节目标（选中规划组后按关节数生成）
-        card2 = GroupCard("关节目标", page)
-        self._goal_host = QWidget(card2)
-        self._goal_layout = QVBoxLayout(self._goal_host)
-        self._goal_layout.setContentsMargins(0, 0, 0, 0)
-        self._goal_layout.setSpacing(6)
-        card2.add(self._goal_host)
-        vl.addWidget(card2)
-
-        # 规划 / 执行
-        card3 = GroupCard("规划执行", page)
-        row = QHBoxLayout()
-        row.setSpacing(6)
-        self.btn_plan = QPushButton("规划", card3)
-        self.btn_plan.setCursor(Qt.PointingHandCursor)
-        self.btn_plan.clicked.connect(lambda: self._do_plan(execute=False))
-        self.btn_exec = QPushButton("执行", card3)
-        self.btn_exec.setCursor(Qt.PointingHandCursor)
-        self.btn_exec.clicked.connect(lambda: self._do_plan(execute=True))
-        self.btn_planexec = QPushButton("规划并执行", card3)
-        self.btn_planexec.setObjectName("btnPrimary")
-        self.btn_planexec.setCursor(Qt.PointingHandCursor)
-        self.btn_planexec.clicked.connect(lambda: self._do_plan(execute=True, plan_first=True))
-        holder = QWidget(card3)
-        holder.setLayout(row)
-        for b in (self.btn_plan, self.btn_exec, self.btn_planexec):
-            row.addWidget(b, 1)
-        card3.add(holder)
-        self.lbl_plan = QLabel("点「启动」后即可规划：仿真模式走假硬件"
-                               "（不需要真电机），真机模式才驱动电机", card3)
-        self.lbl_plan.setObjectName("hintText")
-        self.lbl_plan.setWordWrap(True)
-        card3.add(self.lbl_plan)
-        vl.addWidget(card3)
-        vl.addStretch(1)
-
-        self._goal_sliders: list[tuple[QSlider, QLabel]] = []
-        self._on_group_changed(self.combo_group.currentText())
-        return page
-
-    def _on_group_changed(self, group: str) -> None:
-        while self._goal_layout.count():
-            it = self._goal_layout.takeAt(0)
-            if it.widget():
-                it.widget().deleteLater()
-        self._goal_sliders.clear()
-        joints = GROUP_JOINTS.get(group, [])
-        states = sorted(self._named_states.get(group, {}).keys())
-        self.combo_named.blockSignals(True)
-        self.combo_named.clear()
-        self.combo_named.addItems(states)
-        self.combo_named.blockSignals(False)
-        for i, name in enumerate(joints):
-            row = QWidget(self._goal_host)
-            rl = QVBoxLayout(row)
-            rl.setContentsMargins(0, 0, 0, 0)
-            rl.setSpacing(1)
-            top = QHBoxLayout()
-            lbl = QLabel(f"J{i + 1}" if "joint" in name else "夹爪", row)
-            lbl.setObjectName("jointName")
-            val = QLabel("0.000", row)
-            val.setObjectName("jointVal")
-            val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            top.addWidget(lbl)
-            top.addStretch(1)
-            top.addWidget(val)
-            s = QSlider(Qt.Horizontal, row)
-            if "finger" in name:
-                s.setRange(0, 44)
-            else:
-                s.setRange(-314, 314)
-            s.valueChanged.connect(
-                lambda v, lab=val, fing="finger" in name:
-                lab.setText(f"{v / 1000:.3f}" if fing else f"{v / 100:+.3f}"))
-            rl.addLayout(top)
-            rl.addWidget(s)
-            self._goal_layout.addWidget(row)
-            self._goal_sliders.append((s, val))
-
-    def _goal_values(self) -> list[float]:
-        out = []
-        for i, (s, _v) in enumerate(self._goal_sliders):
-            fing = "finger" in GROUP_JOINTS[self.combo_group.currentText()][i]
-            out.append(s.value() / 1000.0 if fing else s.value() / 100.0)
-        return out
-
-    def _do_plan(self, execute: bool, plan_first: bool = False) -> None:
-        """规划 / 执行 / 规划并执行。
-
-        execute=False → plan_only（3D 里播预览，不动臂）
-        execute=True  → 直接执行
-        plan_first    → 先规划，成功后再自动执行（等同"规划并执行"）
-        """
-        mc = self._moveit
-        if mc is None:
-            self._log("MoveIt 客户端未初始化")
-            return
-        if not self._connected:
-            self._log("未连接：请先点「连接」（仿真用假硬件，不碰电机）")
-            self.lbl_plan.setText("未连接")
-            return
-
-        group = self.combo_group.currentText()
-        vel = float(self.spin_vel.currentText().rstrip("%")) / 100.0
-        planner = f"geometric::{self.combo_planner.currentText()}" \
-            if self.combo_planner.currentText().startswith("RRT") \
-            else f"geometric::{self.combo_planner.currentText()}"
-        ptime = self.spin_time.value()
-        attempts = self.spin_attempts.value()
-        goal = self._goal_values()
-        if not goal:
-            self._log("该规划组没有关节目标")
-            return
-
-        self._log(f"{'规划' if not execute else '执行'} {group}"
-                  f"（{planner}，{ptime:.1f}s，{attempts} 次，速度 {vel:.0%}）")
-        do_exec = execute and not plan_first
-        chained = {"pending": plan_first}
-
-        def done(ok: bool, text: str) -> None:
-            self.log_sig.emit(("✓ " if ok else "✗ ") + text)
-            self.lbl_plan.setText(text)
-            if ok and mc.last_trajectory and self._worker is not None:
-                # 3D 里播一遍规划轨迹（不动机器人），等同 RViz 的绿色路径预览
-                self._worker.play_trajectory(mc.last_joint_names,
-                                             mc.last_trajectory, speed=0.5)
-                self.log_sig.emit(
-                    f"3D 预览：{len(mc.last_trajectory)} 帧轨迹动画")
-            if not ok or not chained["pending"]:
-                return
-            chained["pending"] = False
-            # 规划成功 → 直接执行同一关节目标
-            mc.plan_joint(group, goal, done2, execute=True, vel=vel, acc=vel,
-                          planner_id=planner, planning_time=ptime,
-                          attempts=attempts)
-
-        def done2(ok: bool, text: str) -> None:
-            self.log_sig.emit(("✓ " if ok else "✗ ") + text)
-            self.lbl_plan.setText(text)
-
-        mc.plan_joint(group, goal, done, execute=do_exec, vel=vel, acc=vel,
-                      planner_id=planner, planning_time=ptime, attempts=attempts)
-
     # ── 页面切换 ──────────────────────────────────────
     _PAGE_META = [
         ("概览", "连接状态与双臂实时关节角"),
         ("机器人", "ROS 2 接口与本体参数"),
         ("场景", "3D 视图取景与叠加"),
-        ("关节", "拖动滑块驱动孪生模型"),
-        ("规划", "MoveIt 2 轨迹规划"),
+        ("关节", "滑块驱动孪生 / 真机直发"),
         ("日志", "运行日志"),
     ]
 
@@ -915,20 +714,10 @@ class StudioWindow(QMainWindow):
         self._worker.set_pose({})
 
     def _start_bridge(self) -> None:
-        """只读订阅 /joint_states；失败不影响 3D（此时用本地姿态）。"""
-        self.bridge = RosBridge(on_log=lambda m: self.log_sig.emit(m))
-        if self.bridge.start() and self.bridge._node is not None:  # noqa: SLF001
-            node = self.bridge._node  # noqa: SLF001
-            self.js_pub = JointStatePublisher(node)
-            self._control = ControlClient(node, on_log=lambda m: self.log_sig.emit(m))
-            self._moveit = MoveItClient(node, on_log=lambda m: self.log_sig.emit(m))
-            self._named_states = self._moveit.named_states
-            self._log("仿真状态发布器 + 控制器/MoveIt 客户端就绪")
-            # 命名状态可能从 SRDF 读到了，刷新规划页下拉
-            self._on_group_changed(self.combo_group.currentText())
-            self._bind_actions()
+        """SDK 直连（无 ROS）。连接由用户点「连接」触发，这里只绑按钮。"""
+        self._bind_actions()
 
-    # ── 连接状态机 ────────────────────────────────────
+    # ── 连接状态机（SDK 直连 CAN，无 ROS）───────────────
     def _bind_actions(self) -> None:
         self.btn_connect.setEnabled(True)
 
@@ -956,65 +745,72 @@ class StudioWindow(QMainWindow):
             self._connect()
 
     def _connect(self) -> None:
-        """连接 = 起官方栈并等待 MoveIt 就绪。仿真用假硬件（不碰电机）。"""
+        """连接：仿真=本地 MuJoCo（不碰 CAN）；真机=SDK 直连 can0/can1。"""
         if self._conn_state != "disconnected":
             return
-        fake = self._is_sim
-        self._set_conn_state("connecting", "连接中…")
-        self._log(f"连接：{'仿真（假硬件，不碰电机）' if fake else '真机'}")
-        # 自愈：如果探测到"已有栈在跑"但控制器根本拿不到，说明是残留/半死
-        # 的旧进程 —— 先清掉再重启，否则会一直连着"假栈"然后超时
-        if self._stack.running:
-            alive = self._control is not None and self._control.managers_ready_quick(3.0)
-            if not alive:
-                self._log("检测到残留栈进程但控制器无响应 → 清理后重启")
-                self._stack.stop()
-        if not self._stack.start(fake=fake):
-            self._set_conn_state("disconnected", "连接失败")
+        if self._is_sim:
+            self._set_conn_state("connected", "仿真已就绪")
+            self._log("仿真模式：MuJoCo 本地物理，无需连接硬件")
             return
-        # 探测放后台线程：wait_for_server / list_controllers 都会阻塞，
-        # 放 GUI 线程会让界面假死（表现为"一直连接中"）
+        self._set_conn_state("connecting", "连接中…")
         threading.Thread(target=self._connect_worker, daemon=True,
-                         name="openarm-connect").start()
+                         name="sdk-connect").start()
 
     def _connect_worker(self) -> None:
-        t0 = time.time()
-        while time.time() - t0 < 90:
-            mc, ctl = self._moveit, self._control
-            try:
-                ready_mi = mc is not None and mc.ready(timeout=0.5)
-                ready_ctl = ctl is not None and ctl.managers_ready()
-            except Exception as exc:  # noqa: BLE001
-                self.conn_sig.emit(False, f"探测异常：{exc}")
-                return
-            if ready_mi and ready_ctl:
-                self.conn_sig.emit(True, "已连接")
-                return
-            time.sleep(1.0)
-        self.conn_sig.emit(False, "连接超时")
+        """后台连两条臂（打开 CAN + 轮询线程），成功后**不自动使能**。"""
+        ok_any = False
+        for side, can_if in (("right", "can0"), ("left", "can1")):
+            arm = SdkArm(side, can_if, on_log=lambda m: self.log_sig.emit(m))
+            if arm.connect():
+                self.arms[side] = arm
+                ok_any = True
+        # 等轮询出数据再报成功
+        if ok_any:
+            t0 = time.time()
+            while time.time() - t0 < 5.0:
+                live = [a for a in self.arms.values() if a.positions()]
+                if live:
+                    break
+                time.sleep(0.2)
+        self.conn_sig.emit(ok_any, "已连接" if ok_any else "连接失败（CAN 无电机应答）")
 
     def _on_conn_result(self, ok: bool, text: str) -> None:
         if ok:
             self._set_conn_state("connected", "已连接")
-            self._log("已连接：MoveIt 与控制器就绪，可以规划")
+            self._log(f"{text}：两条 CAN 总线在线。注意电机未使能——"
+                      "点「使能」才上力矩（真机请先确认臂周围安全）")
+            if getattr(self, "btn_enable", None) is not None:
+                self.btn_enable.setVisible(True)
         else:
-            self._set_conn_state("disconnected", text)
-            self._log(f"连接失败：{text}")
+            self._set_conn_state("disconnected", "未连接")
+            self._log(f"{text}")
 
     def _disconnect(self) -> None:
         self._set_conn_state("connecting", "断开中…")
-        self._stack.stop()
+        for side, arm in list(self.arms.items()):
+            arm.disconnect()
+            del self.arms[side]
         self._set_conn_state("disconnected", "未连接")
-        self._log("已断开（进程确认归零，电机失能）")
+        if getattr(self, "btn_enable", None) is not None:
+            self.btn_enable.setVisible(False)
+        self._log("已断开（电机失能，进程无残留）")
 
     def _on_estop(self) -> None:
-        if self._control is None:
-            self._log("急停：控制器客户端未就绪")
+        """急停：全部失能。真机注意手臂会失去力矩下垂。"""
+        if not self.arms:
+            self._log("急停：未连接")
             return
-        ok = self._control.emergency_stop()
-        self._log("急停已下发（控制器全停 → 电机失能）" if ok
-                  else "急停下发失败——立刻手动断电！")
-        self._set_conn_state("connected", "急停" if ok else "急停失败")
+        for arm in self.arms.values():
+            arm.disable()
+        self._set_conn_state("connected", "已失能")
+        self._log("急停已执行：双臂电机全部失能（手臂无力矩，扶稳）")
+
+    def _on_enable_toggle(self) -> None:
+        on = any(a.enabled for a in self.arms.values())
+        for arm in self.arms.values():
+            (arm.disable if on else arm.enable)()
+        self.btn_enable.setText("使能" if on else "失能")
+        self.sum_rows["状态"].setText("已连接·已使能" if not on else "已连接·未使能")
 
     def _on_reset(self) -> None:
         pass
@@ -1132,25 +928,9 @@ class StudioWindow(QMainWindow):
         flay = QVBoxLayout(frame)
         flay.setContentsMargins(0, 0, 0, 0)
         self.view = MujocoViewPanel(frame)
-        self.view.on_target_drag = self._on_target_drag
         flay.addWidget(self.view)
         lay.addWidget(frame, 1)
         return card
-
-    # ── 状态源 ───────────────────────────────────────
-    def _following_real(self) -> bool:
-        if self._is_sim:
-            return False
-        return self.bridge is not None and self.bridge.connected
-
-    def _effective_pose(self) -> dict[str, float]:
-        if self._following_real():
-            assert self.bridge is not None
-            return self.bridge.positions()
-        return dict(self._local_pose)
-
-    def _joint_provider(self) -> dict[str, float]:
-        return self._effective_pose()
 
     def _page_log(self) -> QWidget:
         page = QWidget(self)
@@ -1163,48 +943,23 @@ class StudioWindow(QMainWindow):
         vl.addWidget(self.log_view, 1)
         return page
 
-    # ── 3D 拖拽定目标（RViz 交互标记的等价物）─────────
-    def _on_target_drag(self, world, done: bool) -> None:
-        if not done:
-            return
-        if not self._connected:
-            self._log("拖动目标：未连接，先点「连接」")
-            return
-        side = "left" if self.combo_group.currentText().startswith("left") else "right"
-        _, quat = self._worker.ee_pose(side) if self._worker else (None, None)
-        if quat is None:
-            self._log("拖动目标：拿不到末端位姿")
-            return
-        from geometry_msgs.msg import Pose
-
-        pose = Pose()
-        pose.position.x, pose.position.y, pose.position.z = (float(v) for v in world)
-        pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z = quat
-        group = "left_arm" if side == "left" else "right_arm"
-        group = self.combo_group.currentText() \
-            if self.combo_group.currentText().endswith("_arm") else group
-        mc = self._moveit
-        if mc is None:
-            return
-        vel = float(self.spin_vel.currentText().rstrip("%")) / 100.0
-        self._log(f"拖动目标 → {group} 规划到 "
-                  f"({pose.position.x:.3f}, {pose.position.y:.3f}, "
-                  f"{pose.position.z:.3f})")
-
-        def done_cb(ok: bool, text: str) -> None:
-            self.log_sig.emit(("✓ " if ok else "✗ ") + text)
-            self.lbl_plan.setText(text)
-            if ok and mc.last_trajectory and self._worker is not None:
-                self._worker.play_trajectory(mc.last_joint_names,
-                                             mc.last_trajectory, speed=0.5)
-
-        mc.plan_pose(group, pose, done_cb, execute=False, frame="world",
-                     vel=vel, acc=vel,
-                     planner_id=f"geometric::{self.combo_planner.currentText()}",
-                     planning_time=self.spin_time.value(),
-                     attempts=self.spin_attempts.value())
-
     # ── 关节直控（滑块）──────────────────────────────
+    def _following_real(self) -> bool:
+        if self._is_sim:
+            return False
+        return any(a.connected and a.positions() for a in self.arms.values())
+
+    def _effective_pose(self) -> dict[str, float]:
+        if self._following_real():
+            out = {}
+            for a in self.arms.values():
+                out.update(a.positions())
+            return out
+        return dict(self._local_pose)
+
+    def _joint_provider(self) -> dict[str, float]:
+        return self._effective_pose()
+
     def _rebuild_sliders(self) -> None:
         while self._slider_layout.count():
             item = self._slider_layout.takeAt(0)
@@ -1250,12 +1005,9 @@ class StudioWindow(QMainWindow):
         self._local_pose[name] = val
         if self._worker and not self._following_real():
             self._worker.set_pose(self._local_pose)
-        # 真机已连接：走 forward_position 直接下发（绕过碰撞检查）
-        if self._connected and not self._is_sim and self._control is not None:
-            side = "left" if "left" in name else "right"
-            joints = [self._local_pose.get(f"openarm_{side}_joint{i}", 0.0)
-                      for i in range(1, 8)]
-            self._control.send_positions(side, joints)
+        # 真机已连接+使能：目标进指令队列，50Hz 定时器统一下发
+        if self._connected and not self._is_sim:
+            self._cmd_pose[name] = val
 
     def _zero_pose(self) -> None:
         for sld, val in self._sliders.values():
@@ -1267,27 +1019,33 @@ class StudioWindow(QMainWindow):
         for name in list(self._local_pose):
             if name.startswith(prefix):
                 self._local_pose.pop(name, None)
+                self._cmd_pose.pop(name, None)
         if self._worker and not self._following_real():
             self._worker.set_pose(self._local_pose)
 
     def _poll_controllers(self) -> None:
-        """每 2 秒拉一次控制器状态（真实数据）。"""
-        ctl = self._control
-        if ctl is None or not ctl.managers_ready():
-            for lbl in getattr(self, "ctrl_rows", {}).values():
-                lbl.setText("—")
-            return
-        rows = ctl.list_controllers()
-        state = {n: s for n, _t, s in rows}
-        for cname, lbl in self.ctrl_rows.items():
-            lbl.setText(state.get(cname, "未加载"))
+        """2s 刷新：导航轨双臂 CAN 行（在线/频率/使能态）。"""
+        for side in ("left", "right"):
+            lbl = self.ctrl_rows.get(f"{side}_arm")
+            if lbl is None:
+                continue
+            arm = self.arms.get(side)
+            if arm is None or not arm.connected:
+                lbl.setText("离线")
+            else:
+                lbl.setText(f"{arm.rate:.0f}Hz·{'使能' if arm.enabled else '未使能'}")
 
     def _on_gripper(self, side: str, open_it: bool) -> None:
-        if self._control is None:
-            self._log("夹爪：控制器客户端未就绪")
+        arm = self.arms.get(side)
+        if arm is None or not arm.connected:
+            self._log(f"{side} 夹爪：臂未连接")
             return
-        self._control.gripper(side, GRIP_OPEN if open_it else GRIP_CLOSED,
-                              done_cb=lambda ok, txt: self.log_sig.emit(txt))
+        if not arm.enabled:
+            self._log(f"{side} 夹爪：电机未使能")
+            return
+        self._cmd_pose[f"openarm_{side}_finger_joint1"] = \
+            GRIP_OPEN if open_it else 0.0
+        self._log(f"{side} 夹爪 → {'张开' if open_it else '闭合'}")
     @property
     def _is_sim(self) -> bool:
         return self.sw_mode.currentIndex() == 1
@@ -1320,18 +1078,13 @@ class StudioWindow(QMainWindow):
             self._log(f"启动前检查：最大关节偏差 {worst:.3f} rad —— 可以启动")
 
     def _publish_sim_state(self) -> None:
-        """仿真模式下由本应用发 /joint_states（冒充 broadcaster）。
-
-        但一旦真机栈（含假硬件）在跑，broadcaster 才是唯一合法发布者——
-        两边同时发会让 MoveIt/RViz 收到互相打架的状态，所以此时让位。
-        """
-        if not self._is_sim or self.js_pub is None or self._worker is None:
+        """50Hz：真机模式下把滑块目标经 SDK 直发（MIT 帧）。"""
+        if self._is_sim or not self._cmd_pose:
             return
-        if self._stack.running:
-            return
-        pos = self._worker.positions()
-        if pos:
-            self.js_pub.publish(pos)
+        for side in ("left", "right"):
+            arm = self.arms.get(side)
+            if arm is not None and arm.connected and arm.enabled:
+                arm.set_targets(self._cmd_pose)
 
     def _refresh_status(self) -> None:
         pose = self._effective_pose()
@@ -1370,7 +1123,8 @@ class StudioWindow(QMainWindow):
                 self.row_rate.set_value("1 kHz 物理")
             self.chip_src.setText("仿真")
         elif following:
-            rate = self.bridge.rate if self.bridge else 0.0
+            rates = [a.rate for a in self.arms.values() if a.connected]
+            rate = sum(rates) / len(rates) if rates else 0.0
             self.status_dot.set_state(self._pal_now["success"], "真机在线", breathe=False)
             self.chip_src.setText("真机")
             self.row_link.set_value("已连接")
@@ -1380,16 +1134,12 @@ class StudioWindow(QMainWindow):
             self.chip_src.setText("未连接")
             self.row_link.set_value("未连接")
             self.row_rate.set_value("--")
-        if self._worker is not None:
-            side = "left" if self.combo_group.currentText().startswith("left") else "right"
-            pos, quat = self._worker.ee_pose(side)
-            self.view.set_ee_pose(pos, quat)
         self.row_mode.set_value("仿真" if sim else "真机")
         self.sum_rows["状态"].setText(
             "仿真" if sim else ("跟随真机" if following else "本地姿态"))
         self.sum_rows["模式"].setText("仿真" if sim else "真机")
         self.sum_rows["延迟"].setText(
-            f"{self.bridge.rate:.0f}Hz" if following and self.bridge else "—")
+            f"{rate:.0f}Hz" if following else "—")
         self.sum_rows["上次"].setText(f"{self.view.frame_count}帧")
 
     # ── 日志 ─────────────────────────────────────────
@@ -1405,9 +1155,9 @@ class StudioWindow(QMainWindow):
     # ── 关闭 ─────────────────────────────────────────
     def closeEvent(self, ev) -> None:  # noqa: N802
         self._status_timer.stop()
-        if self.bridge is not None:
-            self.bridge.stop()
-            self.bridge = None
+        for arm in self.arms.values():
+            arm.disconnect()
+        self.arms.clear()
         if self._worker is not None:
             self._worker.stop()
             self._worker.join(timeout=3.0)
