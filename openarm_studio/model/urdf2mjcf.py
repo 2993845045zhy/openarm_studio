@@ -105,36 +105,62 @@ def generate_urdf(out_path: Path, *, bimanual: bool = True,
     return out_path
 
 
-def _mesh_rewrite(text: str, desc_root: Path) -> str:
-    """只做路径改写与 dae→stl 转换，**scale 原样保留**。
+def _mirror_shards(shards: list[Path]) -> list[Path]:
+    """Y 镜像分片（URDF 用负 scale 复用左右臂/手指网格）。
 
-    MuJoCo 的 URDF 导入器本来就支持负 scale（官方 openarm_mujoco 的
-    mesh 声明里就是 scale="1 -1 1"）。早前以为它丢负号、生成镜像文件
-    去补，结果和 MuJoCo 自己的负 scale 叠加成双重镜像，左右手指又回到
-    同一侧——必须交回给 MuJoCo 处理。
+    MuJoCo 的 URDF 导入器在**同一文件被正负 scale 混用**时，去重会把
+    镜像 geom 错配成非镜像网格（实测右臂 right_finger 被绑到非镜像
+    版本、整体外移 8.8cm，而左臂正常）。所以这里把镜像直接烘进几何、
+    scale 写成全正，每个朝向各有唯一文件名，去重无从出错。
     """
+    import numpy as np
+    import trimesh
+
+    outs = []
+    for src in shards:
+        dst = src.with_name(src.stem + "_m.stl")
+        if not dst.exists():
+            g = trimesh.load(str(src), force="mesh")
+            g.apply_transform(np.diag([1.0, -1.0, 1.0, 1.0]))
+            g.export(str(dst))
+        outs.append(dst)
+    return outs
+
+
+def _mesh_rewrite(text: str, desc_root: Path) -> str:
+    """路径改写 + dae→stl + 负 scale 烘焙成镜像文件。"""
     text = text.replace(f"package://{DESC_PACKAGE}/", f"{desc_root}/")
 
     def repl(m: re.Match[str]) -> str:
-        fname = m.group(1)
+        fname, scale = m.group(1), m.group(2)
+        negate = scale is not None and "-" in scale
         src = Path(fname)
-        out: Path | None = None
+        shards: list[Path] | None = None
         if src.suffix.lower() == ".dae":
             try:
-                out = _convert_dae(src)[0]
+                shards = _convert_dae(src)
             except Exception:  # noqa: BLE001
-                out = None
-        if out is None:
-            for cand in (src.with_suffix(".stl"),
-                         Path(str(src).replace("/visual/", "/collision/")).with_suffix(".stl")):
-                if cand.exists():
-                    out = cand
-                    break
-        if out is None:
+                shards = None
+        if shards is None:
+            if src.suffix.lower() == ".stl" and src.exists():
+                shards = [src]
+            else:
+                for cand in (src.with_suffix(".stl"),
+                             Path(str(src).replace("/visual/", "/collision/")).with_suffix(".stl")):
+                    if cand.exists():
+                        shards = [cand]
+                        break
+        if shards is None:
             return m.group(0)
-        return m.group(0).replace(fname, str(out))
+        if negate:
+            shards = _mirror_shards(shards)
+        pos_scale = scale.replace("-", "") if scale else scale
+        out = f'filename="{shards[0]}"'
+        if pos_scale:
+            out += f' scale="{pos_scale}"'
+        return out
 
-    return re.sub(r'filename="([^"]+)"', repl, text)
+    return re.sub(r'filename="([^"]+)"(?:\s+scale="([^"]+)")?', repl, text)
 
 
 COMPILER = (
