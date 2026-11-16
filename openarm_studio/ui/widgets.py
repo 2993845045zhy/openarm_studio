@@ -8,26 +8,28 @@ from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QSizePolicy,
 
 
 class Hairline(QFrame):
+    """zcode SettingsRow 的行间 1px 发丝线。"""
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setObjectName("hairline")
+        self.setObjectName("rowRule")
         self.setFixedHeight(1)
-        # QFrame 默认不画 QSS 背景，必须显式打开，否则整条线是透明的
         self.setAttribute(Qt.WA_StyledBackground, True)
 
 
 class GroupCard(QFrame):
-    """Inspector 里的分组卡片：小标题 + 内容，行间无分隔线。"""
+    """Inspector 里的分组卡片（zcode groupCard：面板色 + 发丝边 + 10px 圆角）。"""
 
     def __init__(self, title: str, parent=None):
         super().__init__(parent)
-        self.setObjectName("inspCard")
+        self.setObjectName("groupCard")
+        self.setAttribute(Qt.WA_StyledBackground, True)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(12, 10, 12, 12)
         outer.setSpacing(8)
 
         self.lbl_title = QLabel(title, self)
-        self.lbl_title.setObjectName("groupLabel")
+        self.lbl_title.setObjectName("groupTitle")
         outer.addWidget(self.lbl_title)
 
         self.body = QVBoxLayout()
@@ -40,17 +42,17 @@ class GroupCard(QFrame):
 
 
 class Row(QWidget):
-    """一行：左标签 + 右侧控件。"""
+    """zcode SettingsRow：左标题（fs_base/500/ink）+ 右值（等宽）。"""
 
     def __init__(self, label: str, widget: QWidget | None = None,
                  parent=None, value: bool = False):
         super().__init__(parent)
-        self.setObjectName("inspRow")
+        self.setObjectName("settingRowHost")
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setContentsMargins(2, 0, 2, 0)
         lay.setSpacing(8)
         self.lbl = QLabel(label, self)
-        self.lbl.setObjectName("rowValue" if value else "rowLabel")
+        self.lbl.setObjectName("fieldValue" if value else "settingTitle")
         lay.addWidget(self.lbl)
         lay.addStretch(1)
         if widget is not None:
@@ -61,22 +63,19 @@ class Row(QWidget):
 
 
 class StatTile(QFrame):
-    """圆角统计瓦片：小标题 + 数值。"""
+    """KPI 瓦片（zcode：透明 + 排版分组，kpiTitle/kpiValue）。"""
 
     def __init__(self, title: str, value: str = "--", parent=None):
         super().__init__(parent)
-        self.setObjectName("statTile")
-        self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setObjectName("statGroup")
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(9, 6, 9, 7)
-        lay.setSpacing(1)
+        lay.setContentsMargins(2, 2, 2, 2)
+        lay.setSpacing(2)
         self.lbl_title = QLabel(title, self)
-        self.lbl_title.setObjectName("jointName")
+        self.lbl_title.setObjectName("kpiTitle")
         self.lbl_value = QLabel(value, self)
-        self.lbl_value.setObjectName("statValue")
+        self.lbl_value.setObjectName("kpiValue")
         self.lbl_value.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.lbl_value.setTextInteractionFlags(Qt.NoTextInteraction)
         lay.addWidget(self.lbl_title)
         lay.addWidget(self.lbl_value)
 
@@ -87,4 +86,4 @@ class StatTile(QFrame):
 class SectionTitle(QLabel):
     def __init__(self, text: str, parent=None):
         super().__init__(text, parent)
-        self.setObjectName("cardTitle")
+        self.setObjectName("sectionHead")

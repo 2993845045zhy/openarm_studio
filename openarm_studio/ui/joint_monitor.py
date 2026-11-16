@@ -57,19 +57,19 @@ class JointOverlay(QFrame):
 
     def __init__(self, provider, pal: dict, parent=None):
         super().__init__(parent)
-        self.setObjectName("jointCapsule")
+        self.setObjectName("jointOverlay")
         self._provider = provider
         self._pal = pal
         self._open = False
         self._bars: dict[str, _JointBar] = {}
 
         self.toggle = QPushButton("关节", self)
-        self.toggle.setObjectName("ghost")
-        self.toggle.setFixedHeight(26)
+        self.toggle.setObjectName("chip")
         self.toggle.setCursor(Qt.PointingHandCursor)
         self.toggle.clicked.connect(self._on_toggle)
 
         self.body = QWidget(self)
+        self.body.setObjectName("jointContent")
         self.body.setVisible(False)
         grid = QGridLayout(self.body)
         grid.setContentsMargins(10, 6, 10, 10)
@@ -114,6 +114,21 @@ class JointOverlay(QFrame):
         for bar in self._bars.values():
             bar._track = pal["panel_alt"]
             bar.bar.setStyleSheet("background: %s; border-radius: 1px;" % pal["panel_alt"])
+        self.update()
+
+    def paintEvent(self, ev) -> None:  # noqa: N802
+        # zcode Popover 形态：QSS 圆角是硬边，外框自绘（抗锯齿 + 发丝边）
+        from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
+
+        pal = self._pal
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        path = QPainterPath()
+        path.addRoundedRect(0.5, 0.5, self.width() - 1.0, self.height() - 1.0, 10, 10)
+        painter.fillPath(path, QColor(pal["panel"]))
+        painter.setPen(QPen(QColor(pal["hairline_strong"])))
+        painter.drawPath(path)
+        super().paintEvent(ev)
 
     def _on_toggle(self) -> None:
         self._open = not self._open

@@ -206,14 +206,15 @@ class StudioWindow(QMainWindow):
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(6)
 
-        header = QFrame(right)
+        # 标题栏本身就是拖动区：面包屑标签不消费鼠标，事件冒泡到这里
+        header = DragHandle(self, right)
         header.setObjectName("shellHeader")
         header.setFixedHeight(34)
         hl = QHBoxLayout(header)
         hl.setContentsMargins(2, 0, 0, 0)
         hl.setSpacing(8)
         self.crumb = QLabel("真机 · 概览", header)
-        self.crumb.setObjectName("breadcrumb")
+        self.crumb.setObjectName("crumb")
         hl.addWidget(self.crumb)
         hl.addStretch(1)
         self.badge_mode = QLabel("数字孪生", header)
@@ -221,8 +222,6 @@ class StudioWindow(QMainWindow):
         hl.addWidget(self.badge_mode)
         self.win_btns = WindowButtons(self, palette(self._theme_name), header)
         hl.addWidget(self.win_btns)
-        drag = DragHandle(self, header)
-        drag.setGeometry(0, 0, 1, 1)
         rl.addWidget(header)
 
         cards = QHBoxLayout()
@@ -240,7 +239,7 @@ class StudioWindow(QMainWindow):
     # ── 导航轨 ────────────────────────────────────────
     def _build_nav(self) -> QFrame:
         nav = QFrame(self)
-        nav.setObjectName("navRail")
+        nav.setObjectName("navPanel")
         nav.setMinimumWidth(SIDE_W)
         nav.setMaximumWidth(SIDE_W)
         lay = QVBoxLayout(nav)
@@ -250,12 +249,12 @@ class StudioWindow(QMainWindow):
         # 品牌区
         brand = QWidget(nav)
         bl = QVBoxLayout(brand)
-        bl.setContentsMargins(0, 0, 0, 0)
+        bl.setContentsMargins(2, 0, 0, 0)
         bl.setSpacing(1)
         title = QLabel("OpenArm Studio", brand)
-        title.setObjectName("navTitle")
+        title.setObjectName("navSummaryTitle")
         sub = QLabel("双臂 · 数字孪生 · 仿真", brand)
-        sub.setObjectName("navSubtitle")
+        sub.setObjectName("navFooter")
         bl.addWidget(title)
         bl.addWidget(sub)
         lay.addWidget(brand)
@@ -265,16 +264,16 @@ class StudioWindow(QMainWindow):
         self.sw_mode.currentIndexChanged.connect(self._on_mode_change)
         lay.addWidget(self.sw_mode)
 
-        # 运行控制
+        # 运行控制（三键等高，pbvs 同款）
         run_row = QHBoxLayout()
         run_row.setSpacing(4)
         self.btn_start = QPushButton("启动", nav)
-        self.btn_start.setObjectName("primary")
+        self.btn_start.setObjectName("btnPrimary")
         self.btn_stop = QPushButton("停止", nav)
+        self.btn_stop.setObjectName("btnDanger")
         self.btn_estop = QPushButton("急停", nav)
-        self.btn_estop.setObjectName("danger")
+        self.btn_estop.setObjectName("btnEstop")
         for b in (self.btn_start, self.btn_stop, self.btn_estop):
-            b.setFixedHeight(32)
             b.setCursor(Qt.PointingHandCursor)
             run_row.addWidget(b, 1)
         lay.addLayout(run_row)
@@ -289,16 +288,16 @@ class StudioWindow(QMainWindow):
             ("日志", "terminal", 5)]))
         lay.addStretch(1)
 
-        # 最近操作
+        # 运行摘要卡
         recent = QFrame(nav)
         recent.setObjectName("navSummary")
         rl = QVBoxLayout(recent)
         rl.setContentsMargins(10, 8, 10, 9)
         rl.setSpacing(3)
         lbl = QLabel("运行摘要", recent)
-        lbl.setObjectName("navGroupLabel")
+        lbl.setObjectName("navSummaryTitle")
         self.lbl_summary = QLabel("空闲 · 未连接", recent)
-        self.lbl_summary.setObjectName("navSubtitle")
+        self.lbl_summary.setObjectName("navSummaryVal")
         self.lbl_summary.setWordWrap(True)
         rl.addWidget(lbl)
         rl.addWidget(self.lbl_summary)
@@ -307,31 +306,29 @@ class StudioWindow(QMainWindow):
         # 底部：主题 + 状态
         foot = QHBoxLayout()
         foot.setSpacing(6)
-        self.sw_theme = ModeSwitch(["浅色", "深色"], nav, height=26)
+        self.sw_theme = ModeSwitch(["浅色", "深色"], nav, height=28)
         self.sw_theme.setCurrentIndex(1 if self._theme_name == "dark" else 0)
         self.sw_theme.currentIndexChanged.connect(
             lambda i: self._apply_theme("dark" if i == 1 else "light"))
         self.lbl_status = QLabel("● 空闲", nav)
-        self.lbl_status.setObjectName("statusText")
+        self.lbl_status.setObjectName("statusDot")
         foot.addWidget(self.sw_theme, 1)
         foot.addWidget(self.lbl_status)
         lay.addLayout(foot)
         return nav
 
     def _nav_group(self, title: str, items: list[tuple[str, str, int]]) -> QWidget:
-        box = QWidget(self)
+        box = QWidget(nav := self)
         vl = QVBoxLayout(box)
         vl.setContentsMargins(0, 0, 0, 0)
         vl.setSpacing(1)
         lbl = QLabel(title, box)
-        lbl.setObjectName("navGroupLabel")
-        lbl.setContentsMargins(8, 4, 0, 2)
+        lbl.setObjectName("navGroupHeader")
         vl.addWidget(lbl)
         for text, icon_name, page in items:
             b = QPushButton(text, box)
             b.setObjectName("navItem")
             b.setCheckable(True)
-            b.setFixedHeight(30)
             b.setCursor(Qt.PointingHandCursor)
             b.setProperty("page", page)
             b.setProperty("iconName", icon_name)
@@ -343,7 +340,7 @@ class StudioWindow(QMainWindow):
     # ── Inspector ─────────────────────────────────────
     def _build_inspector(self) -> QFrame:
         insp = QFrame(self)
-        insp.setObjectName("inspector")
+        insp.setObjectName("inspectorPanel")
         insp.setMinimumWidth(INSP_W)
         insp.setMaximumWidth(INSP_W)
         lay = QVBoxLayout(insp)
@@ -351,14 +348,15 @@ class StudioWindow(QMainWindow):
         lay.setSpacing(10)
 
         self.insp_title = QLabel("概览", insp)
-        self.insp_title.setObjectName("pageTitle")
+        self.insp_title.setObjectName("inspTitle")
         self.insp_desc = QLabel("连接状态与双臂实时关节角", insp)
-        self.insp_desc.setObjectName("pageDesc")
+        self.insp_desc.setObjectName("inspSub")
         self.insp_desc.setWordWrap(True)
         lay.addWidget(self.insp_title)
         lay.addWidget(self.insp_desc)
 
         self.pages = QTabWidget(insp)
+        self.pages.setObjectName("inspectorStack")
         self.pages.tabBar().hide()
         self.pages.setDocumentMode(True)
         self.pages.addTab(self._page_overview(), "概览")
@@ -404,7 +402,7 @@ class StudioWindow(QMainWindow):
         self.btn_check.clicked.connect(self._on_precheck)
         hint = QLabel("启动会让硬件执行回零：所有关节被驱动到 0。"
                       "任一关节偏离零位超过 0.1 rad 时先手动摆正。", card2)
-        hint.setObjectName("hint")
+        hint.setObjectName("hintText")
         hint.setWordWrap(True)
         card2.add(self.btn_check)
         card2.add(hint)
@@ -447,8 +445,7 @@ class StudioWindow(QMainWindow):
         row.setSpacing(4)
         for key, text in (("home", "复位"), ("front", "前"), ("side", "侧"), ("top", "顶")):
             b = QPushButton(text, card)
-            b.setObjectName("tool")
-            b.setFixedHeight(28)
+            b.setObjectName("chip")
             b.setCursor(Qt.PointingHandCursor)
             b.clicked.connect(lambda _=False, k=key: self.view.set_view_preset(k))
             row.addWidget(b, 1)
@@ -459,10 +456,12 @@ class StudioWindow(QMainWindow):
 
         card2 = GroupCard("叠加", page)
         self.btn_wire = QPushButton("线框", card2)
+        self.btn_wire.setObjectName("chip")
         self.btn_wire.setCheckable(True)
         self.btn_wire.setCursor(Qt.PointingHandCursor)
         self.btn_wire.toggled.connect(lambda on: self.view.set_overlay("wireframe", on))
         self.btn_trans = QPushButton("半透明", card2)
+        self.btn_trans.setObjectName("chip")
         self.btn_trans.setCheckable(True)
         self.btn_trans.setCursor(Qt.PointingHandCursor)
         self.btn_trans.toggled.connect(lambda on: self.view.set_overlay("transparent", on))
@@ -496,7 +495,7 @@ class StudioWindow(QMainWindow):
         self.btn_zero.setCursor(Qt.PointingHandCursor)
         self.btn_zero.clicked.connect(self._zero_pose)
         note = QLabel("当前仅驱动 3D 孪生模型；真机下发在「启动」后开放。", card2)
-        note.setObjectName("hint")
+        note.setObjectName("hintText")
         note.setWordWrap(True)
         card2.add(self.btn_zero)
         card2.add(note)
@@ -535,7 +534,7 @@ class StudioWindow(QMainWindow):
         card.add(holder)
 
         self.lbl_plan = QLabel("MoveIt 未就绪（P4 阶段接入 /move_action）", card)
-        self.lbl_plan.setObjectName("hint")
+        self.lbl_plan.setObjectName("hintText")
         self.lbl_plan.setWordWrap(True)
         card.add(self.lbl_plan)
         vl.addWidget(card)
@@ -572,28 +571,28 @@ class StudioWindow(QMainWindow):
         return card
 
     def _build_status_card(self, parent) -> QWidget:
-        card = QFrame(parent)
-        card.setObjectName("statusCard")
-        card.setMinimumWidth(360)
-        lay = QVBoxLayout(card)
-        lay.setContentsMargins(12, 10, 12, 10)
+        # pbvs 风格：工作区内区域透明，靠发丝线分区（不再叠卡片）
+        host = QWidget(parent)
+        host.setMinimumWidth(360)
+        lay = QVBoxLayout(host)
+        lay.setContentsMargins(6, 4, 6, 4)
         lay.setSpacing(8)
 
         head = QHBoxLayout()
         head.setSpacing(6)
-        title = QLabel("状态", card)
-        title.setObjectName("cardTitle")
-        self.chip_src = QLabel("未连接", card)
-        self.chip_src.setObjectName("chip")
+        title = QLabel("状态", host)
+        title.setObjectName("sectionHead")
+        self.chip_src = QLabel("未连接", host)
+        self.chip_src.setObjectName("statusChip")
         head.addWidget(title)
         head.addStretch(1)
         head.addWidget(self.chip_src)
         lay.addLayout(head)
 
-        strip = QFrame(card)
-        strip.setObjectName("statStrip")
+        strip = QFrame(host)
+        strip.setObjectName("statBar")
         sl = QHBoxLayout(strip)
-        sl.setContentsMargins(8, 7, 8, 8)
+        sl.setContentsMargins(10, 8, 10, 9)
         sl.setSpacing(6)
         self.tile_left = StatTile("左臂", "--")
         self.tile_right = StatTile("右臂", "--")
@@ -602,12 +601,12 @@ class StudioWindow(QMainWindow):
             sl.addWidget(t, 1)
         lay.addWidget(strip)
 
-        self.tabs = QTabWidget(card)
+        self.tabs = QTabWidget(host)
         self.tabs.setDocumentMode(True)
-        self.tabs.addTab(self._build_joint_table(card), "关节")
-        self.tabs.addTab(self._build_log_tab(card), "日志")
+        self.tabs.addTab(self._build_joint_table(host), "关节")
+        self.tabs.addTab(self._build_log_tab(host), "日志")
         lay.addWidget(self.tabs, 1)
-        return card
+        return host
 
     def _build_joint_table(self, parent) -> QWidget:
         page = QWidget(parent)
@@ -651,32 +650,38 @@ class StudioWindow(QMainWindow):
         return page
 
     def _build_3d_card(self, parent) -> QWidget:
+        # pbvs 风格：3D 无框融合——sceneFrame 一圈发丝边把画面圈住
         card = QFrame(parent)
         card.setObjectName("view3dCard")
         lay = QVBoxLayout(card)
-        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
 
         head = QHBoxLayout()
-        head.setSpacing(6)
+        head.setContentsMargins(6, 0, 6, 0)
+        head.setSpacing(4)
         title = QLabel("3D 场景", card)
-        title.setObjectName("cardTitle")
+        title.setObjectName("sectionHead")
         self.chip_scene = QLabel("数字孪生", card)
-        self.chip_scene.setObjectName("chip")
+        self.chip_scene.setObjectName("statusChip")
         head.addWidget(title)
         head.addWidget(self.chip_scene)
         head.addStretch(1)
         for key, text in (("home", "复位"), ("front", "前"), ("side", "侧"), ("top", "顶")):
             b = QPushButton(text, card)
-            b.setObjectName("tool")
-            b.setFixedHeight(24)
+            b.setObjectName("chip")
             b.setCursor(Qt.PointingHandCursor)
             b.clicked.connect(lambda _=False, k=key: self.view.set_view_preset(k))
             head.addWidget(b)
         lay.addLayout(head)
 
-        self.view = MujocoViewPanel(card)
-        lay.addWidget(self.view, 1)
+        frame = QFrame(card)
+        frame.setObjectName("sceneFrame")
+        flay = QVBoxLayout(frame)
+        flay.setContentsMargins(0, 0, 0, 0)
+        self.view = MujocoViewPanel(frame)
+        flay.addWidget(self.view)
+        lay.addWidget(frame, 1)
 
         self.joint_overlay = JointOverlay(self._joint_provider, palette(self._theme_name), self.view)
         self.joint_overlay.move(10, 10)

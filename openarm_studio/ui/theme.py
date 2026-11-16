@@ -1,8 +1,9 @@
 """OpenArm Studio 主题系统 —— Zai/zcode 双调色板 + QSS 生成。
 
-与 pbvs_workbench 同源的设计语言（token 值逐一取自
-~/pbvs_workbench/pbvs_workbench/ui/theme.py），本模块只覆盖 OpenArm
-Studio 用到的组件，因此比原版精简，但调色板与尺寸标尺完全一致。
+调色板 token 与 QSS 模板逐值取自 ~/pbvs_workbench/pbvs_workbench/ui/theme.py
+（2026-11-16 用户要求与 pbvs 工作台完全同规格：字体栈、字号档、圆角、
+行高、字重全部保留原值）。未用到的选择器保留（Qt 忽略不存在的
+objectName，缺了才是问题）。
 
 尺寸标尺（几何不随字号缩放）：
     S1 16 / S2 12 / S3 10 / S4 8 / S5 6 / S6 4
@@ -205,314 +206,665 @@ def _rgba(space_sep: str, alpha: float = 1.0) -> list:
     return vals + [alpha]
 
 
-_QSS = """
-QWidget {
-    color: $ink;
-    font-size: $fs_base;
-    font-family: "Noto Sans CJK SC", "Source Han Sans SC", "PingFang SC",
-                 "Microsoft YaHei", sans-serif;
-}
-QWidget#windowRoot {
-    background: $gutter;
-    border-radius: $r1;
-}
-QWidget#windowRoot[maximized="true"] { border-radius: 0px; }
-QWidget#shellBody, QWidget#workspaceBody { background: transparent; }
+# ──────────────────────── QSS 模板（pbvs_workbench 原版） ────────────────────
 
-/* ── 导航轨 ─────────────────────────────────────────── */
-QFrame#navRail {
-    background: $nav_bg;
+_QSS = ("""
+/* OpenArm Studio 主题（由 ui/theme.py 生成，勿手改）——zcode/Zai 风
+   （模板逐值取自 pbvs_workbench，未用选择器保留） */
+
+/* 壳层：根容器画圆角窗口（无边框 + 半透明底），内容在其内 6px。
+   外壳半径 = 面板半径 12 + 缝隙 6 = 18px */
+QMainWindow { background: transparent; }
+QWidget#windowRoot {
+    background-color: $gutter;
+    border: 1px solid $hairline_strong;
+    border-radius: 18px;
+}
+QWidget#windowRoot[maximized="true"] {
+    border-radius: 0;
     border: none;
 }
-QLabel#navTitle { font-size: $fs_lg; font-weight: 600; color: $ink; }
-QLabel#navSubtitle { font-size: $fs_xs; color: $muted; }
-QFrame#navGroupHeader {
+QWidget#shellBody, QScrollArea { background: transparent; }
+QWidget#pageRoot { background: transparent; }
+
+QWidget {
+    color: $ink;
+    font-family: "Inter Variable", "Inter", "Noto Sans SC",
+                 "Noto Sans CJK SC", "Noto Sans", "WenQuanYi Micro Hei",
+                 "Segoe UI", "Microsoft YaHei UI", "DejaVu Sans", sans-serif;
+    font-size: $fs_base;
+    font-weight: 400;
+}
+
+/* ── 分段控件（模式 / 主题）——zcode 分段：槽内凹，激活块滑动 ── */
+QFrame#segmented {
+    background-color: $panel_alt;
+    border: 1px solid $hairline;
+    border-radius: 8px;
+    padding: 2px;
+}
+QFrame#segThumb {
+    background-color: $panel;
+    border: 1px solid $hairline;
+    border-radius: 6px;
+}
+QPushButton#segBtn {
+    background-color: transparent;
+    border: none;
+    border-radius: 6px;
+    padding: 4px 14px;
+    font-size: $fs_base;
+    font-weight: 500;
+    color: $ink2;
+    min-height: 18px;
+}
+QPushButton#segBtn:hover { color: $ink; }
+QPushButton#segBtn:checked {
+    background-color: transparent;
+    color: $ink;
+    font-weight: 600;
+}
+QPushButton#segBtn:disabled { color: $faint; }
+
+/* ── zcode 壳层：外沿底色 + 三个独立面板（4~6px 缝隙露外沿） ── */
+QMainWindow { background-color: transparent; }
+QWidget#shellBody { background-color: transparent; }
+QFrame#inspectorPanel, QFrame#workspaceCard {
+    background-color: $shell_panel;
+    border: 1px solid $hairline_strong;
+    border-radius: 12px;
+}
+QWidget#workspaceBody { background: transparent; }
+QFrame#navPanel {
+    background-color: $nav_bg;
+    border: none;
+    border-radius: 0;
+}
+QScrollArea#navScroll, QWidget#navHost, QScrollArea#inspScroll {
     background: transparent;
     border: none;
 }
-QLabel#navGroupLabel { font-size: $fs_xs; color: $muted; font-weight: 600; letter-spacing: 0.4px; }
 QPushButton#navItem {
     background: transparent;
     border: none;
-    border-radius: $r4;
-    text-align: left;
+    border-radius: 8px;
     padding: 0 10px;
+    text-align: left;
     color: $ink2;
-    font-size: $fs_caption;
+    font-size: $fs_base;
+    font-weight: 400;
+    min-height: 32px;
+    max-height: 32px;
 }
-QPushButton#navItem:hover { background: $nav_hover; color: $ink; }
-QPushButton#navItem:checked { background: $nav_selected; color: $ink; font-weight: 600; }
+QPushButton#navItem:hover { background-color: $nav_hover; color: $ink; }
+QPushButton#navItem[collapsed="true"] { padding: 0; }
+QPushButton#navItem:checked {
+    background-color: $nav_selected;
+    color: $ink;
+    font-weight: 600;
+}
+QLabel#navGroupHeader {
+    background: transparent;
+    border: none;
+    color: $ink;
+    font-size: $fs_base;
+    font-weight: 600;
+    min-height: 26px;
+    max-height: 26px;
+    letter-spacing: 0.01em;
+    padding-left: 10px;
+}
+QWidget#navGroupBody { background: transparent; }
+QWidget#historyRow { background: transparent; }
+QLabel#historyTitle { color: $ink; font-size: $fs_base; background: transparent; }
+QLabel#historyTime { color: $ink2; font-size: $fs_sm; background: transparent; }
 QFrame#navSummary {
-    background: $nav_card;
+    background-color: $nav_card;
     border: 1px solid $hairline;
-    border-radius: $r2;
+    border-radius: 10px;
 }
-
-/* ── Inspector ──────────────────────────────────────── */
-QFrame#inspector {
-    background: $shell_panel;
-    border: none;
-}
-QLabel#pageTitle { font-size: $fs_xl; font-weight: 600; color: $ink; }
-QLabel#pageDesc { font-size: $fs_caption; color: $ink2; }
-QLabel#groupLabel {
-    font-size: $fs_xs; color: $muted; font-weight: 600; letter-spacing: 0.3px;
-}
-QFrame#inspCard {
-    background: $panel;
-    border: 1px solid $hairline;
-    border-radius: $r2;
-}
-QFrame#inspRow { background: transparent; border: none; }
-QLabel#rowLabel { font-size: $fs_caption; color: $ink2; }
-QLabel#rowValue { font-size: $fs_caption; color: $ink; font-weight: 600; }
-QLabel#hint { font-size: $fs_xs; color: $muted; }
-
-/* ── 主卡 ───────────────────────────────────────────── */
-QFrame#workspaceCard {
-    background: $shell_panel;
-    border: 1px solid $hairline;
-    border-radius: $r2;
-}
-QFrame#view3dCard {
-    background: $panel;
-    border: 1px solid $hairline;
-    border-radius: $r2;
-}
-QFrame#statusCard {
-    background: $panel;
-    border: 1px solid $hairline;
-    border-radius: $r2;
-}
-QFrame#cardHeader { background: transparent; border: none; }
-QLabel#cardTitle { font-size: $fs_lg; font-weight: 600; color: $ink; }
-QLabel#chip {
-    font-size: $fs_xs;
-    color: $ink2;
-    background: $surface;
-    border: 1px solid $hairline;
-    border-radius: $r5;
-    padding: 2px 7px;
-}
-QFrame#statStrip {
-    background: $surface;
-    border: none;
-    border-radius: $r3;
-}
-
-/* ── 按钮 ───────────────────────────────────────────── */
-QPushButton {
-    background: $panel;
-    border: 1px solid $hairline_strong;
-    border-radius: $r4;
-    padding: 0 12px;
-    min-height: 30px;
+QLabel#navSummaryTitle { color: $ink; font-size: $fs_base; font-weight: 600; }
+QLabel#navSummaryKey { color: $ink2; font-size: $fs_base; font-weight: 500; }
+QLabel#navSummaryVal {
     color: $ink;
     font-size: $fs_caption;
+    font-weight: 500;
+    font-family: "JetBrains Mono", "Fira Code", "Consolas",
+                 "DejaVu Sans Mono", monospace;
 }
-QPushButton:hover { background: $hover_bg; }
-QPushButton:pressed { background: $selected_bg; }
-QPushButton:disabled { color: $disabled_fg; background: $disabled_bg; border-color: $disabled_border; }
-QPushButton#primary {
-    background: $primary;
-    color: $primary_fg;
-    border: 1px solid $primary;
-    font-weight: 600;
+QFrame#navSeparator {
+    background-color: $hairline;
+    border: none;
+    max-height: 1px;
+    min-height: 1px;
 }
-QPushButton#primary:hover { background: $primary_hover; }
-QPushButton#primary:disabled { background: $primary_off_bg; color: $primary_off_fg; border-color: $primary_off_bg; }
-QPushButton#danger {
-    background: $danger;
-    color: #ffffff;
-    border: 1px solid $danger;
-    font-weight: 600;
+QLabel#navFooter {
+    color: $muted;
+    font-size: $fs_caption;
+    padding: 6px 10px 2px 10px;
+    font-weight: 400;
 }
-QPushButton#danger:hover { background: $danger_hover; }
-QPushButton#danger:pressed { background: $danger_press; }
-QPushButton#ghost {
+QPushButton#navAction {
     background: transparent;
-    border: 1px solid transparent;
+    border: none;
+    border-radius: 8px;
+    padding: 0 10px;
+    text-align: left;
+    color: $ink;
+    font-size: $fs_base;
+    font-weight: 400;
+    min-height: 30px;
+    max-height: 30px;
+}
+QPushButton#navAction:hover { background-color: $nav_hover; }
+QPushButton#navAction:checked {
+    background-color: $nav_selected; font-weight: 600;
+}
+
+/* 工作区顶栏（zcode workspace header）：标题/窗控/可拖动，仅一条底线 */
+QFrame#shellHeader { background: transparent; border: none; }
+QLabel#crumb {
     color: $ink2;
+    font-size: $fs_caption;
+    font-weight: 400;
 }
-QPushButton#ghost:hover { background: $hover_bg; color: $ink; }
-QPushButton#tool {
+
+/* 3D 视口左上角「关节」胶囊 + 展开卡片（zcode Popover 形态） */
+QWidget#jointOverlay { background: transparent; }
+QWidget#jointContent { background: transparent; }
+QLabel#jointTitle { color: $ink; font-size: $fs_base; font-weight: 500; }
+QLabel#jointSection {
+    color: $ink2;
+    font-size: $fs_sm;
+    padding-top: 2px;
+    font-weight: 500;
+}
+QLabel#jointName {
+    color: $ink2;
+    font-size: $fs_sm;
+    font-family: "JetBrains Mono", "Consolas", "DejaVu Sans Mono", monospace;
+    font-weight: 400;
+}
+QLabel#jointVal {
+    color: $ink;
+    font-size: $fs_caption;
+    font-family: "JetBrains Mono", "Consolas", "DejaVu Sans Mono", monospace;
+    font-weight: 500;
+}
+QLabel#jointHint {
+    color: $ink2;
+    font-size: $fs_sm;
+    padding-top: 2px;
+    font-weight: 400;
+}
+
+QMenu {
+    background-color: $panel;
+    border: 1px solid $hairline_strong;
+    border-radius: 8px;
+    padding: 4px;
+    color: $ink;
+}
+QMenu::item {
+    padding: 5px 22px 5px 26px;
+    border-radius: 4px;
+    font-size: $fs_base;
+    font-weight: 400;
+}
+QMenu::item:selected { background-color: $selected_bg; }
+QMenu::indicator { width: 12px; height: 12px; left: 8px; }
+
+QPushButton#navIconBtn {
     background: transparent;
-    border: 1px solid transparent;
-    min-width: 28px;
-    min-height: 26px;
+    border: none;
+    border-radius: 6px;
+    padding: 0;
+    min-width: 26px; max-width: 26px;
+    min-height: 26px; max-height: 26px;
+}
+QPushButton#navIconBtn:hover { background-color: $nav_hover; }
+
+QPushButton#winBtn, QPushButton#winClose {
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    padding: 0;
+    min-width: 28px; max-width: 28px;
+    min-height: 28px; max-height: 28px;
+}
+QPushButton#winBtn:hover { background-color: $hover_bg; }
+QPushButton#winClose:hover { background-color: $danger; }
+
+/* 导航轨按钮的禁用态：收敛成安静的内凹块 */
+QFrame#navPanel QPushButton#btnPrimary:disabled {
+    background-color: transparent;
+    border: 1px solid $hairline_strong;
+    color: $muted;
+}
+QFrame#navPanel QPushButton#btnDanger:disabled {
+    background-color: transparent;
+    border: 1px solid $disabled_border;
+    color: $disabled_fg;
+}
+QFrame#navPanel QPushButton#btnEstop:disabled {
+    background-color: transparent;
+    border: 1px solid $danger_border;
+    color: $danger_ink;
+}
+QFrame#navPanel QPushButton#btnPrimary {
+    border-radius: 8px;
+    font-size: $fs_caption;
+    font-weight: 500;
+    padding: 5px 8px;
+    min-height: 16px;
+    max-height: 16px;
+}
+QFrame#navPanel QPushButton#btnDanger,
+QFrame#navPanel QPushButton#btnEstop {
+    border-radius: 8px;
+    font-size: $fs_caption;
+    font-weight: 600;
+    padding: 5px 8px;
+    min-height: 16px;
+    max-height: 16px;
+}
+
+/* Inspector 内容列：大标题 + 副标题（zcode 设置页 text-2xl/subtle） */
+QLabel#inspTitle {
+    color: $ink;
+    font-size: $fs_xl;
+    font-weight: 600;
+    letter-spacing: 0.2px;
+    padding: 4px 2px 0 2px;
+}
+QLabel#inspSub {
+    color: $ink2;
+    font-size: $fs_caption;
+    line-height: 18px;
+    padding: 5px 2px 0 2px;
+    font-weight: 400;
+}
+QStackedWidget#inspectorStack { background: transparent; }
+
+QFrame#sceneFrame {
+    background-color: $bg;
+    border: 1px solid $hairline;
+    border-radius: 10px;
+}
+
+/* 工具条幽灵按钮（zcode：无边框、hover 变底、选中变底+正常前景） */
+QPushButton#chip {
+    background: transparent;
+    border: none;
+    border-radius: 6px;
+    padding: 3px 8px;
+    color: $ink2;
+    font-size: $fs_sm;
+    font-weight: 500;
+    min-height: 16px;
+    max-height: 16px;
+}
+QPushButton#chipIcon {
+    background: transparent;
+    border: none;
+    border-radius: 6px;
     padding: 0;
 }
-QPushButton#tool:hover { background: $hover_bg; }
-QPushButton#tool:checked { background: $selected_bg; }
+QPushButton#chipIcon:hover { background-color: $hover_bg; }
+QPushButton#chip:hover { background-color: $hover_bg; color: $ink; }
+QPushButton#chip:checked {
+    background-color: $selected_bg;
+    color: $ink;
+    font-weight: 600;
+}
 
-/* ── 输入 ───────────────────────────────────────────── */
+/* ── 卡片 / 分组设置（zcode：面板色卡片 + 发丝边） ── */
+QFrame#groupCard {
+    background-color: $panel;
+    border: 1px solid $hairline;
+    border-radius: 10px;
+}
+QLabel#groupTitle {
+    font-size: $fs_caption;
+    font-weight: 500;
+    color: $ink2;
+    padding-left: 2px;
+}
+QFrame#rowRule {
+    background-color: $hairline;
+    border: none;
+    max-height: 1px;
+}
+QWidget#settingRowHost { background: transparent; }
+QLabel#settingTitle { font-size: $fs_base; font-weight: 500; color: $ink; }
+QLabel#settingDesc { color: $ink2; font-size: $fs_base; line-height: 19px; font-weight: 400; }
+QLabel#groupDesc { color: $ink2; font-size: $fs_caption; padding: 1px 2px 6px 2px; font-weight: 400; }
+
+QFrame#view3dCard {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+}
+QLabel#cardTitle { font-size: $fs_base; font-weight: 500; color: $ink; }
+QLabel#sectionHead { font-size: $fs_base; font-weight: 500; color: $ink; }
+QLabel#statusChip {
+    font-size: $fs_sm;
+    color: $ink2;
+    background-color: $hover_bg;
+    border-radius: 8px;
+    padding: 2px 8px;
+    font-weight: 500;
+}
+QLabel#cardHint { color: $ink2; font-size: $fs_sm; font-weight: 400; }
+QLabel#sectionLabel {
+    font-size: $fs_sm;
+    font-weight: 500;
+    color: $ink2;
+    padding: 0 0 2px 0;
+}
+QLabel#fieldLabel { color: $ink2; font-size: $fs_sm; font-weight: 400; }
+QLabel#hintText { color: $ink2; font-size: $fs_sm; font-weight: 400; }
+QLabel#fieldValue {
+    font-family: "JetBrains Mono", "Fira Code", "Cascadia Mono", "Consolas", "DejaVu Sans Mono", monospace;
+    font-size: $fs_base; font-weight: 500; color: $ink;
+}
+
+QGroupBox {
+    background-color: $panel;
+    border: 1px solid $hairline;
+    border-radius: 12px;
+    padding: 32px 12px 12px 12px;
+    font-weight: 600;
+}
+QGroupBox::title {
+    subcontrol-origin: padding;
+    left: 12px;
+    top: 8px;
+    padding: 0 2px;
+    background-color: transparent;
+    color: $ink2;
+    font-size: $fs_sm;
+    font-weight: 500;
+}
+
+/* ── 按钮（zcode：圆角矩形 6px、hover 只变底色） ── */
+QPushButton {
+    background-color: $panel;
+    border: 1px solid $hairline_strong;
+    border-radius: 6px;
+    padding: 4px 12px;
+    color: $ink;
+    font-weight: 600;
+    font-size: $fs_caption;
+    min-height: 18px;
+}
+QPushButton:hover { background-color: $hover_bg; }
+QPushButton:pressed { background-color: $panel_alt; }
+QPushButton:focus { border-color: $ink2; outline: none; }
+QPushButton:disabled {
+    background-color: $disabled_bg;
+    color: $disabled_fg;
+    border-color: $disabled_border;
+}
+
+QPushButton#btnPrimary {
+    background-color: $primary;
+    border: 1px solid $primary;
+    color: $primary_fg;
+    font-weight: 600;
+}
+QPushButton#btnPrimary:hover { background-color: $primary_hover; border-color: $primary_hover; }
+QPushButton#btnPrimary:pressed { background-color: $primary_press; }
+QPushButton#btnPrimary:disabled {
+    background-color: $primary_off_bg;
+    border-color: $primary_off_bg;
+    color: $primary_off_fg;
+}
+
+QPushButton#btnDanger {
+    background-color: $panel;
+    border: 1px solid $danger_border;
+    color: $danger_ink;
+    font-weight: 600;
+}
+QPushButton#btnDanger:hover { background-color: $danger_soft; border-color: $danger; }
+QPushButton#btnDanger:pressed { background-color: $danger_soft; }
+QPushButton#btnDanger:disabled {
+    background-color: $disabled_bg; color: $disabled_fg; border-color: $disabled_border;
+}
+
+QPushButton#btnEstop {
+    background-color: $danger;
+    border: 1px solid $danger;
+    color: #FFFFFF;
+    font-weight: 700;
+    font-size: $fs_caption;
+    min-height: 22px;
+    padding: 6px 16px;
+    border-radius: 8px;
+}
+QPushButton#btnEstop:hover { background-color: $danger_hover; }
+QPushButton#btnEstop:pressed { background-color: $danger_press; }
+QPushButton#btnEstop:disabled {
+    background-color: $disabled_bg; color: $disabled_fg; border-color: $disabled_border;
+}
+
+QPushButton#btnSecondary {
+    background-color: transparent;
+    border: 1px solid $hairline_strong;
+    color: $ink2;
+}
+QPushButton#btnSecondary:hover { background-color: $hover_bg; color: $ink; }
+QPushButton#btnSecondary:checked {
+    background-color: $selected_bg;
+    border-color: $hairline_strong;
+    color: $ink;
+    font-weight: 600;
+}
+QPushButton#btnSecondary:disabled {
+    background-color: transparent; color: $disabled_fg; border-color: $disabled_border;
+}
+
+/* ── 输入控件（zcode input：同按钮刻度，focus 边框 mono、无光晕） ── */
 QLineEdit, QDoubleSpinBox, QSpinBox {
-    background: $panel_alt;
+    background-color: $panel;
     border: 1px solid $hairline_strong;
-    border-radius: $r4;
-    padding: 0 8px;
-    min-height: 28px;
-    selection-background-color: $accent;
-    selection-color: #ffffff;
+    border-radius: 6px;
+    padding: 4px 8px;
+    color: $ink;
+    font-size: $fs_base;
+    min-height: 18px;
+    selection-background-color: $accent_soft_2;
+    selection-color: $ink;
+    font-weight: 400;
 }
-QLineEdit:focus, QDoubleSpinBox:focus, QSpinBox:focus { border-color: $accent_border; }
+QLineEdit:focus, QDoubleSpinBox:focus, QSpinBox:focus { border-color: $ink2; }
+QLineEdit:disabled, QDoubleSpinBox:disabled, QSpinBox:disabled {
+    color: $disabled_fg; border-color: $disabled_border; background-color: $disabled_bg;
+}
+QSpinBox::up-button, QDoubleSpinBox::up-button, QSpinBox::down-button,
+QDoubleSpinBox::down-button {
+    subcontrol-origin: border;
+    background-color: transparent;
+    border: none;
+    width: 16px;
+}
+QSpinBox::up-button, QDoubleSpinBox::up-button { subcontrol-position: top right; }
+QSpinBox::down-button, QDoubleSpinBox::down-button { subcontrol-position: bottom right; }
+
 QComboBox {
-    background: $panel_alt;
+    background-color: $panel;
     border: 1px solid $hairline_strong;
-    border-radius: $r4;
-    padding: 0 8px;
-    min-height: 28px;
+    border-radius: 6px;
+    padding: 3px 8px;
+    color: $ink;
+    font-size: $fs_caption;
+    min-height: 18px;
 }
-QComboBox::drop-down { border: none; width: 18px; }
+QComboBox:focus { border-color: $ink2; }
+QComboBox:disabled {
+    color: $disabled_fg; border-color: $disabled_border; background-color: $disabled_bg;
+}
+QComboBox::drop-down { border: none; width: 22px; }
 QComboBox QAbstractItemView {
-    background: $panel;
+    background-color: $panel;
     border: 1px solid $hairline_strong;
-    border-radius: $r4;
+    border-radius: 8px;
+    padding: 4px;
+    color: $ink;
+    outline: none;
     selection-background-color: $selected_bg;
     selection-color: $ink;
-    outline: none;
+}
+QComboBox QAbstractItemView::item { padding: 5px 8px; border-radius: 4px; min-height: 18px; }
+QComboBox QAbstractItemView::item:hover { background-color: $hover_bg; }
+
+/* 统计条（zcode bg-surface 圆角条：无边框、无阴影） */
+QFrame#statBar {
+    background-color: $surface;
+    border: none;
+    border-radius: 10px;
 }
 
-/* ── 滑块 ───────────────────────────────────────────── */
-QSlider::groove:horizontal {
-    height: 3px;
-    background: $panel_alt;
-    border-radius: 2px;
+QLabel#statLabel { color: $ink2; font-size: $fs_sm; font-weight: 500; }
+QLabel#statValue {
+    font-family: "JetBrains Mono", "Fira Code", "Cascadia Mono", "Consolas", "DejaVu Sans Mono", monospace;
+    font-size: $fs_caption;
+    font-weight: 500;
+    color: $ink;
 }
-QSlider::sub-page:horizontal { background: $ink2; border-radius: 2px; }
-QSlider::handle:horizontal {
-    background: $panel;
-    border: 1px solid $border_hover_soft;
-    width: 12px;
-    height: 12px;
-    margin: -5px 0;
-    border-radius: 6px;
+QLabel#kpiTitle { color: $ink2; font-size: $fs_caption; font-weight: 500; }
+QLabel#kpiValue {
+    font-family: "JetBrains Mono", "Fira Code", "Cascadia Mono", "Consolas", "DejaVu Sans Mono", monospace;
+    font-size: $fs_stat;
+    font-weight: 600;
+    color: $ink;
 }
-QSlider::handle:horizontal:hover { border-color: $ink2; }
-QSlider:disabled::sub-page:horizontal { background: $disabled_border; }
+QFrame#cardSep {
+    background-color: $hairline;
+    max-height: 1px;
+    border: none;
+}
+QFrame#dashCard {
+    background-color: $panel;
+    border: 1px solid $hairline;
+    border-radius: 8px;
+}
 
-/* ── 页签 ───────────────────────────────────────────── */
-QTabWidget::pane { border: none; background: transparent; }
-QTabBar::tab {
+/* ── 标签页 ── */
+QTabWidget {
     background: transparent;
     border: none;
+    border-radius: 0;
+}
+QTabWidget::pane {
+    background-color: transparent;
+    border: none;
+    padding: 10px 16px 10px 16px;
+}
+QTabWidget::tab-bar { left: 16px; }
+QTabBar { background-color: transparent; }
+QTabBar::tab {
+    background-color: transparent;
+    border: none;
+    padding: 6px 12px;
+    margin-right: 2px;
     color: $muted;
-    padding: 5px 10px;
-    font-size: $fs_caption;
+    font-weight: 400;
+    font-size: $fs_base;
 }
 QTabBar::tab:selected { color: $ink; font-weight: 600; }
-QTabBar::tab:hover { color: $ink2; }
+QTabBar::tab:hover:!selected { color: $ink2; }
 
-/* ── 分段控件 ───────────────────────────────────────── */
-QFrame#segTrack {
-    background: $panel_alt;
-    border: none;
-    border-radius: $r5;
-}
-QFrame#segThumb {
-    background: $panel;
-    border: 1px solid $hairline_strong;
-    border-radius: $r5;
-}
-QPushButton#segBtn {
-    background: transparent;
-    border: none;
-    border-radius: $r5;
-    padding: 0;
-    min-height: 24px;
-    color: $muted;
-    font-size: $fs_xs;
-    font-weight: 600;
-}
-QPushButton#segBtn:hover { color: $ink2; }
-QPushButton#segBtn:checked { color: $ink; }
-QPushButton#segBtn:disabled { color: $disabled_fg; }
-
-/* ── 日志/文本 ──────────────────────────────────────── */
+/* ── 文本 / 日志 ── */
 QPlainTextEdit, QTextEdit {
-    background: $panel_alt;
-    border: 1px solid $hairline;
-    border-radius: $r3;
-    padding: 6px;
-    font-family: "JetBrains Mono", "Noto Sans Mono", monospace;
-    font-size: $fs_xs;
+    background-color: transparent;
+    border: none;
+    border-radius: 0;
+    padding: 10px 12px;
+    font-family: "JetBrains Mono", "Consolas", "DejaVu Sans Mono", monospace;
+    font-size: $fs_caption;
     color: $ink2;
+    selection-background-color: $accent_soft_2;
+    selection-color: $ink;
+    font-weight: 400;
+}
+QPlainTextEdit:focus, QTextEdit:focus { border-color: $hairline_strong; }
+QPlainTextEdit#consoleLog {
+    background-color: transparent; color: $ink2; border: none;
 }
 
-/* ── 滚动条 ─────────────────────────────────────────── */
-QScrollArea { background: transparent; border: none; }
-QScrollBar:vertical { background: transparent; width: 10px; margin: 0; }
+/* ── 复选框 ── */
+QCheckBox { spacing: 6px; color: $ink; font-size: $fs_base; font-weight: 400; }
+QCheckBox::indicator {
+    width: 16px; height: 16px; border-radius: 4px;
+    border: 1px solid $hairline_strong; background-color: $panel;
+}
+QCheckBox::indicator:hover { border-color: $ink2; }
+QCheckBox::indicator:checked { background-color: $primary; border-color: $primary; }
+QCheckBox::indicator:disabled { border-color: $disabled_border; background-color: $disabled_bg; }
+
+/* ── 滚动条（悬浮圆条）/ tooltip / 对话框 ── */
+QDialog {
+    background-color: $panel;
+    border: 1px solid $hairline;
+}
+QMessageBox QLabel { background: transparent; color: $ink; }
+QMessageBox QPushButton { min-width: 64px; }
+QScrollBar:vertical { background: transparent; width: 14px; margin: 2px 0; }
 QScrollBar::handle:vertical {
-    background: $scroll;
-    border-radius: 5px;
-    min-height: 28px;
+    background: $scroll; border-radius: 4px; min-height: 30px;
+    margin: 2px 3px;
 }
 QScrollBar::handle:vertical:hover { background: $scroll_hover; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
-QScrollBar:horizontal { background: transparent; height: 10px; }
-QScrollBar::handle:horizontal { background: $scroll; border-radius: 5px; min-width: 28px; }
+QScrollBar:horizontal { background: transparent; height: 14px; margin: 0 2px; }
+QScrollBar::handle:horizontal {
+    background: $scroll; border-radius: 4px; min-width: 30px;
+    margin: 3px 2px;
+}
+QScrollBar::handle:horizontal:hover { background: $scroll_hover; }
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
-
-QSplitter::handle { background: transparent; }
-
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
 QToolTip {
-    background: $tooltip_bg;
-    color: $tooltip_fg;
-    border: 1px solid $hairline_strong;
-    border-radius: $r5;
-    padding: 4px 8px;
-    font-size: $fs_xs;
+    background-color: $tooltip_bg; color: $tooltip_fg;
+    border: 1px solid $hairline_strong; border-radius: 8px;
+    padding: 5px 10px; font-size: $fs_sm;
+    font-weight: 400;
 }
 
-/* ── 状态点 ─────────────────────────────────────────── */
-QLabel#statusText { font-size: $fs_xs; color: $ink2; }
-QFrame#hairline { background: $hairline; border: none; }
+/* 空态 */
+QLabel#emptyTitle { color: $ink; font-size: $fs_base; font-weight: 500; background: transparent; }
+QLabel#emptyHint { color: $ink2; font-size: $fs_caption; background: transparent; }
 
-/* ── 关节条 ─────────────────────────────────────────── */
-QFrame#jointRow { background: transparent; border: none; }
-QLabel#jointName { font-size: $fs_xs; color: $muted; }
-QLabel#jointVal {
-    font-size: $fs_xs;
-    color: $ink;
-    font-family: "JetBrains Mono", "Noto Sans Mono", monospace;
-}
+/* 状态点文字 */
+QWidget#statusDot { color: $muted; font-size: $fs_caption; font-weight: 600; }
 
-/* ── 统计瓦片 ───────────────────────────────────────── */
-QFrame#statTile {
-    background: $panel_alt;
+/* 键帽 chip */
+QLabel#kbd {
+    background-color: $panel_alt;
     border: 1px solid $hairline;
-    border-radius: $r3;
-}
-QLabel#statValue {
-    font-size: $fs_stat;
-    font-weight: 600;
-    color: $ink;
-    font-family: "JetBrains Mono", "Noto Sans Mono", monospace;
-}
-
-/* ── 3D 视图底 ──────────────────────────────────────── */
-QWidget#mjPanel { background: $bg; }
-QLabel#mjHint { font-size: $fs_xs; color: $muted; }
-QFrame#jointCapsule {
-    background: $panel;
-    border: 1px solid $hairline_strong;
-    border-radius: $r3;
-}
-QLabel#breadcrumb { font-size: $fs_caption; color: $ink2; }
-QLabel#modeBadge {
+    border-radius: 4px;
+    color: $ink2;
     font-size: $fs_xs;
-    font-weight: 600;
-    color: $accent_ink;
-    background: $accent_soft;
-    border: 1px solid $accent_border;
-    border-radius: $r5;
-    padding: 2px 8px;
+    font-weight: 500;
+    padding: 0 5px;
 }
-"""
 
-# 尺寸标尺（几何不随字号缩放）
-_RADII = {"r1": 18, "r2": 12, "r3": 10, "r4": 8, "r5": 6, "r6": 4}
+QSplitter::handle { background-color: transparent; }
+QSplitter::handle:hover { background-color: transparent; }
+
+/* ── 对比度收口：说明/标签类统一 ink2，$muted 只留给禁用态与装饰 ── */
+QLabel#navSummaryKey, QLabel#navFooter,
+QLabel#jointSection, QLabel#jointHint,
+QLabel#inspSub, QLabel#toolLabel,
+QLabel#groupDesc, QLabel#cardHint,
+QLabel#fieldLabel, QLabel#hintText,
+QLabel#statusChip, QTabBar::tab {
+    color: $ink2;
+}
+""")
 
 
 def build_qss(theme: dict) -> str:
@@ -520,13 +872,8 @@ def build_qss(theme: dict) -> str:
 
     必须按标识符边界替换：朴素 str.replace 会让 `$ink` 吃掉 `$ink2`
     的前缀（pbvs 踩过的坑，QSS 会整体失效且被 Qt 静默丢弃）。
-    圆角 token 的值自带 `px`，模板里只写 `$r4`（写 `$r4` 会因边界保护
-    匹配不到，QSS 直接非法）。
     """
-    sub = dict(theme)
-    for key, val in _RADII.items():
-        sub[key] = f"{val}px"
     qss = _QSS
-    for key, val in sub.items():
+    for key, val in theme.items():
         qss = re.sub(r"\$" + re.escape(key) + r"(?![A-Za-z0-9_])", str(val), qss)
     return qss

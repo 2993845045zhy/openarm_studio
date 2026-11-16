@@ -18,7 +18,7 @@ class ModeSwitch(QFrame):
 
     def __init__(self, labels: list[str], parent=None, height: int = 30):
         super().__init__(parent)
-        self.setObjectName("segTrack")
+        self.setObjectName("segmented")
         self.setFixedHeight(height)
         self._labels = list(labels)
         self._index = 0
