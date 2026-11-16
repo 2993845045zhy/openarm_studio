@@ -37,7 +37,16 @@ class SimBackend:
         mujoco.mj_resetData(self.model, self.data)
         for name, idx in self._amap.items():
             self.data.ctrl[idx] = self._targets.get(name, 0.0)
+        # 预稳定：从零位起跑时重力会把臂拽垂再被伺服拉回（用户看到的
+        # "一打开就乱动"）。先空跑 0.5s 物理让瞬态衰减完再交给渲染。
+        for _ in range(250):
+            self._apply_ctrl()
+            mujoco.mj_step(self.model, self.data)
         mujoco.mj_forward(self.model, self.data)
+
+    def _apply_ctrl(self) -> None:
+        for name, idx in self._amap.items():
+            self.data.ctrl[idx] = self._targets.get(name, 0.0)
 
     def set_targets(self, targets: dict[str, float]) -> None:
         for name, val in targets.items():
@@ -53,8 +62,7 @@ class SimBackend:
         return dict(self._targets)
 
     def step(self) -> None:
-        for name, idx in self._amap.items():
-            self.data.ctrl[idx] = self._targets.get(name, 0.0)
+        self._apply_ctrl()
         for _ in range(SUBSTEPS):
             mujoco.mj_step(self.model, self.data)
 

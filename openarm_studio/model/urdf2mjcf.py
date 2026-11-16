@@ -86,7 +86,13 @@ def generate_urdf(out_path: Path, *, bimanual: bool = True,
         raise FileNotFoundError(
             "找不到 openarm_description 包；请在 ~/openarm_ws 下先 colcon build")
     xacro_file = root / "urdf/robot/v10.urdf.xacro"
-    args = [f"bimanual:={'true' if bimanual else 'false'}", f"arm_type:={arm_type}"]
+    # hand:=true 必须显式传：缺了它手部装配段整段不展开，
+    # hand/finger link 没有装配关节，会被 MuJoCo 焊死在世界原点
+    args = [
+        f"bimanual:={'true' if bimanual else 'false'}",
+        f"arm_type:={arm_type}",
+        "hand:=true",
+    ]
     env = _ros_env()
     proc = subprocess.run(
         ["/opt/ros/jazzy/bin/xacro", str(xacro_file), *args],
@@ -159,8 +165,14 @@ def _convert_dae(src: Path) -> list[Path]:
     import trimesh
 
     scene = trimesh.load(str(src), force="scene")
+    # dae 的每个子网格带自己的装配变换（在 scene graph 里），
+    # 必须先烘焙再合并——直接取 scene.geometry 拿到的是局部坐标，
+    # 分片会各自错位（手指/手掌散架的根源）
     groups: dict[tuple, list] = {}
-    for geom in (scene.geometry or {}).values():
+    for node_name in scene.graph.nodes_geometry:
+        transform, geom_name = scene.graph[node_name]
+        geom = scene.geometry[geom_name].copy()
+        geom.apply_transform(transform)
         color = None
         mat = getattr(geom.visual, "material", None)
         try:

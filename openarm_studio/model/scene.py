@@ -182,17 +182,22 @@ def build_spec(urdf_path: Path, *, sky_rgb: list[float], floor_rgb: list[float],
         % (grid_png, sky, sky, floor_reflect)
     )
     scene = (
-        '<light name="key" pos="1.1 -1.3 1.9" dir="-0.45 0.55 -1" '
-        'diffuse="%g %g %g" castshadow="false"/>'
-        '<light name="fill" pos="-1.5 0.9 1.1" dir="0.6 -0.4 -1" '
-        'diffuse="%g %g %g" castshadow="false"/>'
-        '<light name="rim" pos="-0.2 1.8 1.4" dir="0 -0.9 -0.6" '
-        'diffuse="%g %g %g" castshadow="false"/>'
+        # 灯光照 pbvs 场景标准：暖调主光(key) + 冷调补光(fill) + 顶光(top)
+        # + 工作区聚光(work_spot)，方向光为主、spot 补层次
+        '<light name="key" directional="true" pos="0.5 -1.5 2.5" dir="-0.15 0.45 -0.87" '
+        'diffuse="%s %s %s" specular="0.12 0.12 0.12" castshadow="false"/>'
+        '<light name="fill" directional="true" pos="-1.5 0.5 2.0" dir="0.55 -0.2 -0.81" '
+        'diffuse="%s %s %s" specular="0.03 0.03 0.03" castshadow="false"/>'
+        '<light name="top" directional="true" pos="0 0 3" dir="0 0 -1" '
+        'diffuse="%s %s %s" specular="0.02 0.02 0.02" castshadow="false"/>'
+        '<light name="work_spot" pos="0.18 -0.32 2.0" dir="0 0 -1" cutoff="55" '
+        'exponent="1.5" diffuse="%s %s %s" specular="0.05 0.05 0.05" castshadow="false"/>'
         '<geom name="floor" type="plane" size="4 4 0.05" pos="0 0 0" '
         'material="floor_mat" contype="0" conaffinity="0"/>'
-        % (0.42 * s, 0.42 * s, 0.42 * s,
-           0.20 * s, 0.21 * s, 0.23 * s,
-           0.14 * s, 0.14 * s, 0.15 * s)
+        % (0.60 * s, 0.58 * s, 0.53 * s,
+           0.20 * s, 0.22 * s, 0.27 * s,
+           0.15 * s, 0.16 * s, 0.18 * s,
+           0.45 * s, 0.45 * s, 0.45 * s)
     )
     visual = (
         '<visual><headlight ambient="0.30 0.30 0.31" diffuse="0.30 0.30 0.31" '

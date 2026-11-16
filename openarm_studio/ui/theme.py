@@ -487,8 +487,9 @@ QLabel#inspSub {
 QStackedWidget#inspectorStack { background: transparent; }
 
 QFrame#sceneFrame {
-    background-color: $bg;
-    border: 1px solid $hairline;
+    /* 无界融合（pbvs 标准）：无边框无底色，画面与卡片融为一体 */
+    background: transparent;
+    border: none;
     border-radius: 10px;
 }
 
