@@ -46,10 +46,13 @@ def _apply_finishes(xml: str) -> str:
         colors = {k: tuple(v) for k, v in json.loads(meta_path.read_text()).items()}
 
     # mesh name → 分片名（MjSpec 导出的 mesh 名 = 文件 stem，colors.json
-    # 的键同样是无后缀 stem）
+    # 的键同样是无后缀 stem；镜像分片(_m)的键也带 _m，颜色查同 hash 正版）
     mesh_file = {}
     for m in _re.finditer(r'<mesh\s+name="([^"]+)"[^>]*file="([^"]+)"', xml):
-        mesh_file[m.group(1)] = _P(m.group(2)).stem
+        stem = _P(m.group(2)).stem
+        if stem.endswith("_m"):
+            stem = stem[:-2]
+        mesh_file[m.group(1)] = stem
 
     mat_names = {}       # rgb -> 材质名
     mats_xml = []
@@ -95,7 +98,6 @@ def _apply_finishes(xml: str) -> str:
                 return tag
             return tag[:-2] + f' material="{mat}"/>'
         return tag
-
     xml = _re.sub(r'<geom name="([^"]+)"[^>]*/>', repl, xml)
     if mats_xml:
         xml = _inject_into(xml, "asset", "".join(mats_xml))

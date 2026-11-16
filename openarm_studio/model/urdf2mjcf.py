@@ -105,25 +105,62 @@ def generate_urdf(out_path: Path, *, bimanual: bool = True,
     return out_path
 
 
+def _mirror_shards(shards: list[Path], key: str) -> list[Path]:
+    """对分片做 Y 镜像（URDF 用负 scale 复用左右臂/手指网格）。
+
+    MjSpec 会把同文件 mesh 声明合并且丢掉负 scale——左右臂、两根
+    手指全部变成同一份未镜像几何、挤在同一侧。这里直接生成镜像版
+    STL（几何翻 Y + 面序反转），URDF 里的 scale 改写成全正。
+    """
+    import trimesh
+
+    outs = []
+    for src in shards:
+        dst = src.with_name(src.stem + "_m.stl")
+        if not dst.exists():
+            g = trimesh.load(str(src), force="mesh")
+            g.apply_transform(__import__("numpy").diag([1.0, -1.0, 1.0, 1.0]))
+            g.export(str(dst))
+        outs.append(dst)
+    return outs
+
+
 def _mesh_rewrite(text: str, desc_root: Path) -> str:
     text = text.replace(f"package://{DESC_PACKAGE}/", f"{desc_root}/")
 
     def repl(m: re.Match[str]) -> str:
-        src = Path(m.group(1))
-        if src.suffix.lower() != ".dae":
+        fname, scale = m.group(1), m.group(2)
+        negate = scale is not None and "-" in scale
+        suffix = '.stl' if fname.lower().endswith('.stl') else None
+        src = Path(fname)
+        shards: list[Path] | None = None
+        if src.suffix.lower() == ".dae":
+            try:
+                shards = _convert_dae(src)
+            except Exception:  # noqa: BLE001
+                shards = None
+        if shards is None:
+            # 非 dae（或转换失败）：同目录/碰撞目录的 stl
+            if src.suffix.lower() == ".stl" and src.exists():
+                shards = [src]
+            else:
+                for cand in (src.with_suffix(".stl"),
+                             Path(str(src).replace("/visual/", "/collision/")).with_suffix(".stl")):
+                    if cand.exists():
+                        shards = [cand]
+                        break
+        if shards is None:
             return m.group(0)
-        # .dae → 按颜色拆分的 STL（首片代表整体，scene.py 展开多色）
-        try:
-            shards = _convert_dae(src)
-            return f'filename="{shards[0]}"'
-        except Exception:  # noqa: BLE001
-            for cand in (src.with_suffix(".stl"),
-                         Path(str(src).replace("/visual/", "/collision/")).with_suffix(".stl")):
-                if cand.exists():
-                    return f'filename="{cand}"'
-            return m.group(0)
+        if negate:
+            shards = _mirror_shards(shards, src.stem)
+        pos_scale = scale.replace("-", "") if scale else scale
+        out = f'filename="{shards[0]}"'
+        if pos_scale:
+            out += f' scale="{pos_scale}"'
+        return out
 
-    return re.sub(r'filename="([^"]*)"', repl, text)
+    # filename 与 scale 成对处理（scale 可选）
+    return re.sub(r'filename="([^"]+)"(?:\s+scale="([^"]+)")?', repl, text)
 
 
 COMPILER = (
@@ -221,14 +258,15 @@ def dae_color_map() -> dict[str, tuple]:
     return {}
 
 
-_SHARD_RE = re.compile(r"^(?P<stem>.+)_(?P<idx>\d+)_(?P<hash>[0-9a-f]{10})\.stl$")
+_SHARD_RE = re.compile(r"^(?P<stem>.+)_(?P<idx>\d+)_(?P<hash>[0-9a-f]{10})(?P<mirror>_m)?\.stl$")
 
 
 def _expand_visual_shards(text: str) -> str:
     """把指向分片 0 的 <visual> 复制成 N 份（每色一片）。
 
     URDF 允许一个 link 多个 visual；MjSpec 会为每个 visual 生成一个
-    geom。分片 idx 与 colors.json 的颜色一一对应。
+    geom。分片 idx 与 colors.json 的颜色一一对应。镜像分片（_m 后缀）
+    一起展开，镜像版的颜色沿用同 hash 正版的记录。
     """
     cache = _mesh_cache()
     import re as _re
@@ -242,19 +280,21 @@ def _expand_visual_shards(text: str) -> str:
         hit = _SHARD_RE.match(shard)
         if not hit or hit.group("idx") != "0":
             return block
-        prefix, key = hit.group("stem"), hit.group("hash")
-        siblings = sorted(cache.glob(f"{prefix}_*_{key}.stl"))
+        prefix, key, mirror = hit.group("stem"), hit.group("hash"), hit.group("mirror") or ""
+        siblings = sorted(cache.glob(f"{prefix}_*_{key}*.stl"))
         if len(siblings) <= 1:
             return block
         extra = []
-        for i, sib in enumerate(siblings[1:], start=1):
-            idx = _SHARD_RE.match(sib.name).group("idx")
+        for sib in siblings[1:]:
+            sh = _SHARD_RE.match(sib.name)
+            idx, mir = sh.group("idx"), ("m" if sh.group("mirror") else "")
             new_block = block.replace(fname.group(1), str(sib))
             name_m = _re.search(r'name="([^"]+)"', new_block)
             if name_m:
+                # 后缀带 hash 短版保证全局唯一（左右臂/正镜像复用同 dae）
                 new_block = new_block.replace(
                     f'name="{name_m.group(1)}"',
-                    f'name="{name_m.group(1)}_c{idx}"')
+                    f'name="{name_m.group(1)}_c{key[:4]}{idx}{mir}"')
             extra.append(new_block)
         return block + "".join(extra)
 
