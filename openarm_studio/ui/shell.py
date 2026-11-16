@@ -57,6 +57,7 @@ class RenderWorker(threading.Thread):
         self._pose: dict[str, float] = {}
         self._latest: dict[str, float] = {}
         self._mode = "twin"
+        self._pending_sync = False
         self._rebuild = True
         self._running = True
         self._ready = threading.Event()
@@ -73,6 +74,7 @@ class RenderWorker(threading.Thread):
     def set_mode(self, mode: str) -> None:
         with self._lock:
             self._mode = mode
+            self._pending_sync = (mode == "sim")
 
     def positions(self) -> dict[str, float]:
         with self._lock:
@@ -116,9 +118,20 @@ class RenderWorker(threading.Thread):
                 with self._lock:
                     pose = dict(self._pose)
                     mode = self._mode
+                    pending_sync = self._pending_sync
+                    self._pending_sync = False
                 assert self.model is not None and self.data is not None
 
                 if mode == "sim" and self.sim is not None:
+                    if pending_sync:
+                        # 切进仿真：伺服目标钉在当前姿态再预热，
+                        # 否则刚度 230 的伺服会一把把臂拽到旧目标
+                        self.sim.set_targets(self.sim.positions())
+                        self.sim.sync_targets_to_current()
+                        self.sim.settle(steps=200)
+                        pose = self.sim.positions()
+                        with self._lock:
+                            self._pose = dict(pose)
                     self.sim.set_targets(pose)
                     self.sim.step()
                     render_data = self.sim.data
@@ -1010,7 +1023,7 @@ class StudioWindow(QMainWindow):
             self.status_dot.set_state(self._pal_now["accent"], "仿真运行中", breathe=True)
             self.chip_src.setText("仿真")
             self.row_link.set_value("MuJoCo 物理")
-            self.row_rate.set_value("200 Hz 物理")
+            self.row_rate.set_value("1 kHz 物理")
         elif following:
             rate = self.bridge.rate if self.bridge else 0.0
             self.status_dot.set_state(self._pal_now["success"], "真机在线", breathe=False)

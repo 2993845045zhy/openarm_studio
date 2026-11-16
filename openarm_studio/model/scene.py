@@ -216,6 +216,12 @@ def build_spec(urdf_path: Path, *, sky_rgb: list[float], floor_rgb: list[float],
     xml = _inject_into(xml, "asset", assets)
     xml = _inject_into(xml, "worldbody", scene)
     xml = _apply_finishes(xml)
+    # 积分器/步长照官方：implicitfast + 1kHz。默认 Euler + 2ms 配
+    # kp=230 的伺服会数值发散（表现就是"一点仿真就抖/乱动"）
+    if "<option" not in xml:
+        xml = xml.replace("</mujoco>",
+                          '<option timestep="0.001" integrator="implicitfast" '
+                          'cone="elliptic" impratio="10"/></mujoco>', 1)
     # 位置伺服 actuator：仿真模式下由指令驱动关节，而不是直接改 qpos
     xml = _inject_into(xml, "actuator", _actuators())
     # URDF 的 <mimic>（finger2 跟随 finger1）MuJoCo 导入时会丢弃，
