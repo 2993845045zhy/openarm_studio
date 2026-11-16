@@ -22,7 +22,9 @@ from PySide6.QtWidgets import (QComboBox, QDoubleSpinBox, QFrame, QHBoxLayout,
                                QWidget)
 
 from ..core.mjview import MjEmbedRenderer
+from ..core.sim import SimBackend
 from ..model import scene as model_scene
+from ..ros.bridge import JointStatePublisher, RosBridge
 from .chrome import DragHandle, ResizeHandles, WindowButtons
 from .icons import ICONS
 from .joint_monitor import JointOverlay
@@ -50,17 +52,28 @@ class RenderWorker(threading.Thread):
         self._log = on_log or (lambda *_: None)
         self._lock = threading.Lock()
         self._pose: dict[str, float] = {}
+        self._latest: dict[str, float] = {}
+        self._mode = "twin"
         self._rebuild = True
         self._running = True
         self._ready = threading.Event()
         self.model: mujoco.MjModel | None = None
         self.data: mujoco.MjData | None = None
+        self.sim: SimBackend | None = None
         self._qmap: dict[str, int] = {}
 
     # ── 外部接口（线程安全）────────────────────────────
     def set_pose(self, positions: dict[str, float]) -> None:
         with self._lock:
             self._pose = dict(positions)
+
+    def set_mode(self, mode: str) -> None:
+        with self._lock:
+            self._mode = mode
+
+    def positions(self) -> dict[str, float]:
+        with self._lock:
+            return dict(self._latest)
 
     def set_theme(self, theme_name: str) -> None:
         with self._lock:
@@ -90,22 +103,36 @@ class RenderWorker(threading.Thread):
                     self.model = model_scene.build_model(self._cache, sc)
                     self.data = mujoco.MjData(self.model)
                     self._qmap = model_scene.joint_qpos_map(self.model)
+                    self.sim = SimBackend(self.model)
                     with self._lock:
                         self._rebuild = False
                     self._ready.set()
                     self._log(f"3D 模型就绪（{theme}）：nq={self.model.nq} "
-                              f"ngeom={self.model.ngeom}")
+                              f"ngeom={self.model.ngeom} nu={self.model.nu}")
 
                 with self._lock:
                     pose = dict(self._pose)
-                assert self.data is not None and self.model is not None
-                for name, val in pose.items():
-                    idx = self._qmap.get(name)
-                    if idx is not None:
-                        self.data.qpos[idx] = float(val)
-                mujoco.mj_forward(self.model, self.data)
+                    mode = self._mode
+                assert self.model is not None and self.data is not None
 
-                rgb = renderer.render(self.model, self.data, self._panel.cam_state())
+                if mode == "sim" and self.sim is not None:
+                    self.sim.set_targets(pose)
+                    self.sim.step()
+                    render_data = self.sim.data
+                    latest = self.sim.positions()
+                else:
+                    # 孪生：外部姿态直接写 qpos（运动学镜像，不跑物理）
+                    render_data = self.data
+                    for name, val in pose.items():
+                        idx = self._qmap.get(name)
+                        if idx is not None:
+                            render_data.qpos[idx] = float(val)
+                    mujoco.mj_forward(self.model, render_data)
+                    latest = dict(pose)
+                with self._lock:
+                    self._latest = latest
+
+                rgb = renderer.render(self.model, render_data, self._panel.cam_state())
                 self._panel.push_frame(rgb)
                 time.sleep(1 / 30)
         except Exception as exc:  # noqa: BLE001
@@ -125,6 +152,9 @@ class StudioWindow(QMainWindow):
         self._theme_name = theme_name
         self._reduced = False
         self._worker: RenderWorker | None = None
+        self.bridge: RosBridge | None = None
+        self.js_pub: JointStatePublisher | None = None
+        self._local_pose: dict[str, float] = {}
 
         self.setWindowTitle("OpenArm Studio")
         self.resize(1560, 960)
@@ -137,12 +167,18 @@ class StudioWindow(QMainWindow):
         self._apply_theme(theme_name, animate=False)
         self._goto_page(0)
         self._start_render()
+        self._start_bridge()
 
         self.log_sig.connect(self._append_log)
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(200)
         self._status_timer.timeout.connect(self._refresh_status)
         self._status_timer.start()
+        # 仿真模式要按 50Hz 发 /joint_states（MoveIt/RViz 依赖这个频率）
+        self._pub_timer = QTimer(self)
+        self._pub_timer.setInterval(20)
+        self._pub_timer.timeout.connect(self._publish_sim_state)
+        self._pub_timer.start()
 
     # ── 构建 ──────────────────────────────────────────
     def _build_ui(self) -> None:
@@ -691,10 +727,9 @@ class StudioWindow(QMainWindow):
         pair = self._sliders.get(name)
         if pair:
             pair[1].setText(f"{val:+.3f}" if not is_grip else f"{val:.3f}")
-        pose = self._worker.joint_positions() if self._worker else {}
-        pose[name] = val
-        if self._worker:
-            self._worker.set_pose(pose)
+        self._local_pose[name] = val
+        if self._worker and not self._following_real():
+            self._worker.set_pose(self._local_pose)
 
     def _zero_pose(self) -> None:
         for s, val in self._sliders.values():
@@ -702,11 +737,33 @@ class StudioWindow(QMainWindow):
             s.setValue(0)
             s.blockSignals(False)
             val.setText("+0.000")
-        if self._worker:
-            self._worker.set_pose({})
+        # 只清滑块涉及的关节，别把另一条臂的姿态也抹掉
+        prefix = "openarm_left" if self.combo_arm.currentIndex() == 0 else "openarm_right"
+        for name in list(self._local_pose):
+            if name.startswith(prefix):
+                self._local_pose.pop(name, None)
+        if self._worker and not self._following_real():
+            self._worker.set_pose(self._local_pose)
+
+    def _following_real(self) -> bool:
+        # 仿真模式下状态源是 MuJoCo 自己，不跟真机
+        if self._is_sim:
+            return False
+        return self.bridge is not None and self.bridge.connected
+
+    def _effective_pose(self) -> dict[str, float]:
+        """仿真 → MuJoCo 物理状态；真机在线 → /joint_states；否则本地滑块姿态。"""
+        if self._is_sim and self._worker is not None:
+            pos = self._worker.positions()
+            if pos:
+                return pos
+        if self._following_real():
+            assert self.bridge is not None
+            return self.bridge.positions()
+        return dict(self._local_pose)
 
     def _joint_provider(self) -> dict[str, float]:
-        return self._worker.joint_positions() if self._worker else {}
+        return self._effective_pose()
 
     # ── 页面切换 ──────────────────────────────────────
     _PAGE_META = [
@@ -750,10 +807,26 @@ class StudioWindow(QMainWindow):
         self._worker.start()
         self._worker.set_pose({})
 
+    def _start_bridge(self) -> None:
+        """只读订阅 /joint_states；失败不影响 3D（此时用本地姿态）。"""
+        self.bridge = RosBridge(on_log=lambda m: self.log_sig.emit(m))
+        if self.bridge.start() and self.bridge._node is not None:  # noqa: SLF001
+            self.js_pub = JointStatePublisher(self.bridge._node)  # noqa: SLF001
+            self._log("仿真状态发布器就绪（仅仿真模式使用）")
+    @property
+    def _is_sim(self) -> bool:
+        return self.sw_mode.currentIndex() == 1
+
     def _on_mode_change(self, idx: int) -> None:
-        self.chip_scene.setText("物理仿真" if idx == 1 else "数字孪生")
-        self.badge_mode.setText("仿真" if idx == 1 else "数字孪生")
-        self._log(f"模式：{'仿真' if idx == 1 else '真机'}")
+        sim = idx == 1
+        if self._worker is not None:
+            self._worker.set_mode("sim" if sim else "twin")
+            if sim:
+                # 切到仿真时把目标对齐到当前姿态，避免一进去就甩过去
+                self._worker.set_pose(self._worker.positions())
+        self.chip_scene.setText("物理仿真" if sim else "数字孪生")
+        self.badge_mode.setText("仿真" if sim else "数字孪生")
+        self._log(f"模式：{'物理仿真（MuJoCo 重力和位置伺服在工作）' if sim else '数字孪生（跟随 /joint_states）'}")
         self._goto_page(self.pages.currentIndex())
 
     def _on_precheck(self) -> None:
@@ -765,8 +838,27 @@ class StudioWindow(QMainWindow):
         else:
             self._log(f"启动前检查：最大关节偏差 {worst:.3f} rad —— 可以启动")
 
+    def _publish_sim_state(self) -> None:
+        if not self._is_sim or self.js_pub is None or self._worker is None:
+            return
+        pos = self._worker.positions()
+        if pos:
+            self.js_pub.publish(pos)
+
     def _refresh_status(self) -> None:
-        pose = self._joint_provider()
+        pose = self._effective_pose()
+        following = self._following_real()
+        sim = self._is_sim
+        pub = getattr(self, "js_pub", None)
+
+        if sim:
+            # 仿真模式由上位机冒充 joint_state_broadcaster
+            if pub is not None and pose:
+                pub.publish(pose)
+        elif self._worker is not None and following:
+            # 跟真机时把姿态推给渲染线程（滑块姿态暂停生效）
+            self._worker.set_pose(pose)
+
         left = [pose.get(f"openarm_left_joint{i}", 0.0) for i in range(1, 8)]
         right = [pose.get(f"openarm_right_joint{i}", 0.0) for i in range(1, 8)]
         gl = pose.get("openarm_left_finger_joint1", 0.0)
@@ -776,10 +868,27 @@ class StudioWindow(QMainWindow):
         self.tile_grip.set_value(f"{(gl + gr) / 2:.3f} m")
         for name, lbl in self.joint_rows.items():
             lbl.setText(f"{pose.get(name, 0.0):+.3f}")
-        self.lbl_status.setText("● 3D 运行中")
-        self.row_mode.set_value("仿真" if self.sw_mode.currentIndex() == 1 else "真机")
+
+        if sim:
+            self.lbl_status.setText("● 仿真运行中")
+            self.chip_src.setText("仿真")
+            self.row_link.set_value("MuJoCo 物理")
+            self.row_rate.set_value("200 Hz 物理")
+        elif following:
+            rate = self.bridge.rate if self.bridge else 0.0
+            self.lbl_status.setText("● 真机在线")
+            self.chip_src.setText("真机")
+            self.row_link.set_value("已连接")
+            self.row_rate.set_value(f"{rate:.0f} Hz")
+        else:
+            self.lbl_status.setText("● 3D 运行中")
+            self.chip_src.setText("未连接")
+            self.row_link.set_value("未连接")
+            self.row_rate.set_value("--")
+        self.row_mode.set_value("仿真" if sim else "真机")
         self.lbl_summary.setText(
-            f"{'仿真' if self.sw_mode.currentIndex() == 1 else '真机'} · "
+            f"{'仿真' if sim else '真机'} · "
+            f"{'物理仿真' if sim else ('跟随真机' if following else '本地姿态')} · "
             f"3D {self.view.frame_count} 帧")
 
     # ── 日志 ─────────────────────────────────────────
@@ -795,6 +904,9 @@ class StudioWindow(QMainWindow):
     # ── 关闭 ─────────────────────────────────────────
     def closeEvent(self, ev) -> None:  # noqa: N802
         self._status_timer.stop()
+        if self.bridge is not None:
+            self.bridge.stop()
+            self.bridge = None
         if self._worker is not None:
             self._worker.stop()
             self._worker.join(timeout=3.0)

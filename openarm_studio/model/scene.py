@@ -127,6 +127,8 @@ def build_spec(urdf_path: Path, *, sky_rgb: list[float], floor_rgb: list[float],
 
     xml = _inject_into(xml, "asset", assets)
     xml = _inject_into(xml, "worldbody", scene)
+    # 位置伺服 actuator：仿真模式下由指令驱动关节，而不是直接改 qpos
+    xml = _inject_into(xml, "actuator", _actuators())
     # visual 块：有就合并，没有就插到 </mujoco> 前
     if "<visual>" in xml:
         xml = xml.replace("<visual>", "<visual>", 1)
@@ -134,6 +136,26 @@ def build_spec(urdf_path: Path, *, sky_rgb: list[float], floor_rgb: list[float],
     else:
         xml = xml.replace("</mujoco>", visual + "</mujoco>", 1)
     return xml
+
+
+def _actuators() -> str:
+    """16 个位置伺服（左右各 7 关节 + 夹爪）。
+
+    kp 按"能顶住自重"标定：肩部大关节给到 200，肘/腕逐级降低；
+    dampratio=1 让伺服临界阻尼，不会来回荡。
+    夹爪力很小，避免仿真里"啪"地撞死。
+    """
+    arm_kp = [200.0, 200.0, 150.0, 120.0, 45.0, 35.0, 30.0]
+    out = []
+    for side in ("left", "right"):
+        for i, kp in enumerate(arm_kp, start=1):
+            out.append(f'<position name="{side}_joint{i}_act" '
+                       f'joint="openarm_{side}_joint{i}" kp="{kp}" '
+                       f'dampratio="1" ctrllimited="true" ctrlrange="-3.5 3.5"/>')
+        out.append(f'<position name="{side}_grip_act" '
+                   f'joint="openarm_{side}_finger_joint1" kp="60" '
+                   f'dampratio="1" ctrllimited="true" ctrlrange="0 0.044"/>')
+    return "".join(out)
 
 
 def _inject_into(xml: str, tag: str, payload: str) -> str:
