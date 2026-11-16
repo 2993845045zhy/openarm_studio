@@ -60,27 +60,19 @@ def _apply_finishes(xml: str) -> str:
         if key not in mat_names:
             r, g, b = (v / 255.0 for v in rgb)
             mean = (r + g + b) / 3.0
-            # dae 颜色 → 实物部件（用户逐件确认）：
-            #   251 银白 = 机加铝件；63 灰 = 电机外壳（金属）；
-            #   24 深黑 = ABS 打印件
+            # 照官方 openarm_mujoco v2 的两档材质标准：
+            #   silver  rgba 0.65  specular 1.0 shininess 0.9 reflectance 0.8
+            #   black   rgba 0.247 reflectance 0.05 shininess 0.5（原值，不提亮）
+            # dae 亮色(251/160)→银、深色(63/24/0)→黑；官方就这两档
             if mean > 0.45:
-                # 银色机加件：金属高光，基色不变
-                spec, shin, metal, rough = 0.85, 0.6, 1.0, 0.35
-                lift = 1.0
-            elif mean > 0.15:
-                # 电机外壳（63）：深灰金属（用户确认是金属）
-                spec, shin, metal, rough = 0.6, 0.5, 0.85, 0.4
-                lift = 1.3
+                rgba = "0.65 0.65 0.65 1"
+                attrs = 'specular="1.0" shininess="0.9" reflectance="0.8"'
             else:
-                # ABS 打印件（24/0）：深灰黑，ABS 半哑光柔和高光
-                spec, shin, metal, rough = 0.32, 0.4, 0.0, 0.55
-                lift = 3.2
-            r, g, b = (min(1.0, v * lift) for v in (r, g, b))
+                rgba = "0.247 0.247 0.247 1"
+                attrs = 'reflectance="0.05" shininess="0.5"'
             if key not in seen_mats:
                 mats_xml.append(
-                    f'<material name="{key}" rgba="{r:.3f} {g:.3f} {b:.3f} 1" '
-                    f'specular="{spec}" shininess="{shin}" metallic="{metal}" '
-                    f'roughness="{rough}"/>')
+                    f'<material name="{key}" rgba="{rgba}" {attrs}/>')
                 seen_mats.add(key)
             mat_names[rgb] = key
         return mat_names[rgb]
@@ -212,7 +204,7 @@ def build_spec(urdf_path: Path, *, sky_rgb: list[float], floor_rgb: list[float],
            0.45 * s, 0.45 * s, 0.45 * s)
     )
     visual = (
-        '<visual><headlight ambient="0.30 0.30 0.31" diffuse="0.30 0.30 0.31" '
+        '<visual><headlight ambient="0.42 0.42 0.44" diffuse="0.55 0.55 0.57" '
         'specular="0 0 0"/>'
         '<global offwidth="1600" offheight="1200" ipd="0"/>'
         '<map haze="%g" fogstart="1.2" fogend="6"/>'
@@ -239,20 +231,21 @@ def build_spec(urdf_path: Path, *, sky_rgb: list[float], floor_rgb: list[float],
 def _actuators() -> str:
     """16 个位置伺服（左右各 7 关节 + 夹爪）。
 
-    kp 按"能顶住自重"标定：肩部大关节给到 200，肘/腕逐级降低；
-    dampratio=1 让伺服临界阻尼，不会来回荡。
-    夹爪力很小，避免仿真里"啪"地撞死。
+    kp/kv 照抄官方 openarm_mujoco v2（按电机型号分档）：
+    J1/J2 DM8009 kp230 kv2.7；J3/J4 DM4340 kp190 kv2.2；
+    J5-J7 DM4310 kp30 kv1.5；手指 kp10 kv0.2。
     """
-    arm_kp = [200.0, 200.0, 150.0, 120.0, 45.0, 35.0, 30.0]
+    arm = [(230.0, 2.7), (230.0, 2.7), (190.0, 2.2), (190.0, 2.2),
+           (30.0, 1.5), (30.0, 1.5), (30.0, 1.5)]
     out = []
     for side in ("left", "right"):
-        for i, kp in enumerate(arm_kp, start=1):
+        for i, (kp, kv) in enumerate(arm, start=1):
             out.append(f'<position name="{side}_joint{i}_act" '
-                       f'joint="openarm_{side}_joint{i}" kp="{kp}" '
-                       f'dampratio="1" ctrllimited="true" ctrlrange="-3.5 3.5"/>')
+                       f'joint="openarm_{side}_joint{i}" kp="{kp}" kv="{kv}" '
+                       f'ctrllimited="true" ctrlrange="-3.5 3.5"/>')
         out.append(f'<position name="{side}_grip_act" '
-                   f'joint="openarm_{side}_finger_joint1" kp="60" '
-                   f'dampratio="1" ctrllimited="true" ctrlrange="0 0.044"/>')
+                   f'joint="openarm_{side}_finger_joint1" kp="10" kv="0.2" '
+                   f'ctrllimited="true" ctrlrange="0 0.044"/>')
     return "".join(out)
 
 
