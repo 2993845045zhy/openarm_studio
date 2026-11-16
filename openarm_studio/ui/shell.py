@@ -87,6 +87,20 @@ class RenderWorker(threading.Thread):
         with self._lock:
             return dict(self._latest)
 
+    def ee_pose(self, side: str = "left"):
+        """末端（hand）世界位姿：((x,y,z), (w,x,y,z))。"""
+        with self._lock:
+            model, data = self.model, self.data
+        if model is None or data is None:
+            return None, None
+        name = f"openarm_{side}_hand"
+        bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+        if bid < 0:
+            return None, None
+        pos = tuple(float(v) for v in data.xpos[bid])
+        quat = tuple(float(v) for v in data.xquat[bid])
+        return pos, quat
+
     def play_trajectory(self, names: list[str], points: list[list[float]],
                         speed: float = 0.5) -> None:
         """把规划轨迹转成「关节名→角度」序列，交给渲染循环逐帧播放。"""
@@ -1101,6 +1115,7 @@ class StudioWindow(QMainWindow):
         flay = QVBoxLayout(frame)
         flay.setContentsMargins(0, 0, 0, 0)
         self.view = MujocoViewPanel(frame)
+        self.view.on_target_drag = self._on_target_drag
         flay.addWidget(self.view)
         lay.addWidget(frame, 1)
         return card
@@ -1130,6 +1145,47 @@ class StudioWindow(QMainWindow):
         self.log_view.setMaximumBlockCount(3000)
         vl.addWidget(self.log_view, 1)
         return page
+
+    # ── 3D 拖拽定目标（RViz 交互标记的等价物）─────────
+    def _on_target_drag(self, world, done: bool) -> None:
+        if not done:
+            return
+        if not self._connected:
+            self._log("拖动目标：未连接，先点「连接」")
+            return
+        side = "left" if self.combo_group.currentText().startswith("left") else "right"
+        _, quat = self._worker.ee_pose(side) if self._worker else (None, None)
+        if quat is None:
+            self._log("拖动目标：拿不到末端位姿")
+            return
+        from geometry_msgs.msg import Pose
+
+        pose = Pose()
+        pose.position.x, pose.position.y, pose.position.z = (float(v) for v in world)
+        pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z = quat
+        group = "left_arm" if side == "left" else "right_arm"
+        group = self.combo_group.currentText() \
+            if self.combo_group.currentText().endswith("_arm") else group
+        mc = self._moveit
+        if mc is None:
+            return
+        vel = float(self.spin_vel.currentText().rstrip("%")) / 100.0
+        self._log(f"拖动目标 → {group} 规划到 "
+                  f"({pose.position.x:.3f}, {pose.position.y:.3f}, "
+                  f"{pose.position.z:.3f})")
+
+        def done_cb(ok: bool, text: str) -> None:
+            self.log_sig.emit(("✓ " if ok else "✗ ") + text)
+            self.lbl_plan.setText(text)
+            if ok and mc.last_trajectory and self._worker is not None:
+                self._worker.play_trajectory(mc.last_joint_names,
+                                             mc.last_trajectory, speed=0.5)
+
+        mc.plan_pose(group, pose, done_cb, execute=False, frame="world",
+                     vel=vel, acc=vel,
+                     planner_id=f"geometric::{self.combo_planner.currentText()}",
+                     planning_time=self.spin_time.value(),
+                     attempts=self.spin_attempts.value())
 
     # ── 关节直控（滑块）──────────────────────────────
     def _rebuild_sliders(self) -> None:
@@ -1307,6 +1363,10 @@ class StudioWindow(QMainWindow):
             self.chip_src.setText("未连接")
             self.row_link.set_value("未连接")
             self.row_rate.set_value("--")
+        if self._worker is not None:
+            side = "left" if self.combo_group.currentText().startswith("left") else "right"
+            pos, quat = self._worker.ee_pose(side)
+            self.view.set_ee_pose(pos, quat)
         self.row_mode.set_value("仿真" if sim else "真机")
         self.sum_rows["状态"].setText(
             "仿真" if sim else ("跟随真机" if following else "本地姿态"))

@@ -121,6 +121,14 @@ class MujocoViewPanel(QWidget):
         self._collision = False
         self._press = None
         self._last_t = time.monotonic()
+        # 末端拖拽目标（世界坐标）+ 当前末端位姿
+        self._ee_world: tuple | None = None
+        self._ee_quat: tuple | None = None
+        self._target_world: tuple | None = None
+        self._drag_marker = False
+        self._drag_base = None
+        self.on_target_drag = None      # callback(world_xyz, done: bool)
+        self._fovy = 45.0
 
         # 开场运镜状态
         self._intro_t0 = time.monotonic()
@@ -166,7 +174,57 @@ class MujocoViewPanel(QWidget):
         st["collision"] = self._collision
         return st
 
-    # ── 对外操作 ──────────────────────────────────────
+    # ── 末端目标标记（拖拽规划）──────────────────────
+    def set_ee_pose(self, pos: tuple | None, quat: tuple | None = None) -> None:
+        self._ee_world = pos
+        self._ee_quat = quat
+        if self._target_world is None and pos is not None:
+            self._target_world = pos
+
+    def ee_quat(self) -> tuple | None:
+        return self._ee_quat
+
+    def clear_target(self) -> None:
+        self._target_world = None
+
+    def _project(self, p_world) -> tuple[float, float, float] | None:
+        """世界点 → 面板像素坐标 + 深度（相机基向量投影）。"""
+        with self._lock:
+            cam = dict(self._cam_s)
+        look = np.array(cam["lookat"], dtype=float)
+        fwd, right, up = _cam_basis(cam["azimuth"], cam["elevation"])
+        rel = np.array(p_world, dtype=float) - look
+        depth = float(rel @ fwd)
+        if depth <= 0.05:
+            return None
+        half_h = math.tan(math.radians(self._fovy) / 2.0) * depth
+        half_w = half_h * (self.width() / max(1, self.height()))
+        sx = float(rel @ right) / half_w
+        sy = float(rel @ up) / half_h
+        if abs(sx) > 1.2 or abs(sy) > 1.2:
+            return None
+        return ((sx + 1.0) * 0.5 * self.width(),
+                (1.0 - sy) * 0.5 * self.height(), depth)
+
+    def _draw_target_marker(self, rgb: np.ndarray) -> None:
+        if self._target_world is None:
+            return
+        pr = self._project(self._target_world)
+        if pr is None:
+            return
+        x, y, _d = pr
+        pal = self._pal or {}
+        col = _hex_rgb(pal.get("accent", "#4099ff"))
+        bgr = (col[2], col[1], col[0])
+        h, w = rgb.shape[:2]
+        if not (0 <= x < w and 0 <= y < h):
+            return
+        cv2.circle(rgb, (int(x), int(y)), 11, bgr, 2, cv2.LINE_AA)
+        cv2.circle(rgb, (int(x), int(y)), 2, bgr, -1, cv2.LINE_AA)
+        for dx, dy in ((0, -17), (0, 17), (-17, 0), (17, 0)):
+            cv2.line(rgb, (int(x), int(y)),
+                     (int(x + dx * 0.6), int(y + dy * 0.6)), bgr, 1, cv2.LINE_AA)
+
     def start_intro(self) -> None:
         self._intro_t0 = time.monotonic()
         self._intro_done = False
@@ -253,6 +311,7 @@ class MujocoViewPanel(QWidget):
             arr = (bg[None, None, :] * (1.0 - a)
                    + arr.astype(np.float32) * a).astype(np.uint8)
 
+        self._draw_target_marker(arr)
         self._draw_axis_gizmo(arr)
 
         qimg = QImage(arr.data, w, h, w * 3, QImage.Format_RGB888)
@@ -375,12 +434,45 @@ class MujocoViewPanel(QWidget):
     # ── 鼠标交互 ──────────────────────────────────────
     def mousePressEvent(self, ev) -> None:  # noqa: N802
         self._cancel_intro()
+        if ev.button() == Qt.LeftButton and self._target_world is not None:
+            pr = self._project(self._target_world)
+            if pr is not None:
+                dx = ev.position().x() - pr[0]
+                dy = ev.position().y() - pr[1]
+                if (dx * dx + dy * dy) ** 0.5 < 20:
+                    self._drag_marker = True
+                    self._drag_base = (ev.position().x(), ev.position().y(),
+                                       pr[2], tuple(self._target_world))
+                    self.setCursor(Qt.ClosedHandCursor)
+                    return
         self._press = (ev.button(), ev.position().x(), ev.position().y())
 
     def mouseReleaseEvent(self, ev) -> None:  # noqa: N802
+        if self._drag_marker:
+            self._drag_marker = False
+            self.setCursor(Qt.ArrowCursor)
+            if self.on_target_drag is not None and self._target_world is not None:
+                self.on_target_drag(self._target_world, True)
+            self._drag_base = None
+            return
         self._press = None
 
     def mouseMoveEvent(self, ev) -> None:  # noqa: N802
+        if self._drag_marker and self._drag_base is not None:
+            x0, y0, depth, base = self._drag_base
+            x, y = ev.position().x(), ev.position().y()
+            with self._lock:
+                cam = dict(self._cam_s)
+            fwd, right, up = _cam_basis(cam["azimuth"], cam["elevation"])
+            half_h = math.tan(math.radians(self._fovy) / 2.0) * depth
+            half_w = half_h * (self.width() / max(1, self.height()))
+            wx = (x - x0) / max(1, self.width()) * 2.0 * half_w
+            wy = -(y - y0) / max(1, self.height()) * 2.0 * half_h
+            newp = tuple(np.array(base) + right * wx + up * wy)
+            self._target_world = newp
+            if self.on_target_drag is not None:
+                self.on_target_drag(newp, False)
+            return
         if self._press is None:
             return
         btn, px, py = self._press
