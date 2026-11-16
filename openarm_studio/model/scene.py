@@ -61,18 +61,19 @@ def _apply_finishes(xml: str) -> str:
             r, g, b = (v / 255.0 for v in rgb)
             mean = (r + g + b) / 3.0
             # dae 颜色 → 实物部件（用户逐件确认）：
-            #   251 银白 = 机加铝件；63 灰 = 电机外壳；24 深黑 = 打印塑料件
+            #   251 银白 = 机加铝件；63 灰 = 电机外壳（金属）；
+            #   24 深黑 = ABS 打印件
             if mean > 0.45:
                 # 银色机加件：金属高光，基色不变
                 spec, shin, metal, rough = 0.85, 0.6, 1.0, 0.35
                 lift = 1.0
             elif mean > 0.15:
-                # 电机外壳（63）：近黑哑光，只提一点保证轮廓可辨
-                spec, shin, metal, rough = 0.15, 0.25, 0.0, 0.6
-                lift = 1.15
+                # 电机外壳（63）：深灰金属（用户确认是金属）
+                spec, shin, metal, rough = 0.6, 0.5, 0.85, 0.4
+                lift = 1.3
             else:
-                # 3D 打印塑料件（24/0）：黑色带塑料柔和高光，提亮到深灰黑
-                spec, shin, metal, rough = 0.35, 0.45, 0.0, 0.55
+                # ABS 打印件（24/0）：深灰黑，ABS 半哑光柔和高光
+                spec, shin, metal, rough = 0.32, 0.4, 0.0, 0.55
                 lift = 3.2
             r, g, b = (min(1.0, v * lift) for v in (r, g, b))
             if key not in seen_mats:
