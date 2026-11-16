@@ -132,8 +132,9 @@ class RenderWorker(threading.Thread):
                 with self._lock:
                     self._latest = latest
 
-                rgb = renderer.render(self.model, render_data, self._panel.cam_state())
-                self._panel.push_frame(rgb)
+                state = self._panel.cam_state()
+                rgb = renderer.render(self.model, render_data, state)
+                self._panel.push_frame(rgb, wire=state.get("wireframe"))
                 time.sleep(1 / 30)
         except Exception as exc:  # noqa: BLE001
             self._log(f"[3D] 渲染线程异常: {type(exc).__name__}: {exc}")
@@ -844,6 +845,12 @@ class StudioWindow(QMainWindow):
         self.badge_mode.setText("仿真" if sim else "数字孪生")
         self._log(f"模式：{'物理仿真（MuJoCo 重力和位置伺服在工作）' if sim else '数字孪生（跟随 /joint_states）'}")
         self._goto_page(self.pages.currentIndex())
+
+    def showEvent(self, ev) -> None:  # noqa: N802
+        super().showEvent(ev)
+        if not getattr(self, "_intro_started", False):
+            self._intro_started = True
+            self.view.start_intro()
 
     def _on_precheck(self) -> None:
         pose = self._joint_provider()
