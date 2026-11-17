@@ -34,7 +34,8 @@ class GroupCard(QFrame):
 
         self.body = QVBoxLayout()
         self.body.setContentsMargins(0, 0, 0, 0)
-        self.body.setSpacing(7)
+        # 卡内行距与卡片外边距（outer.spacing=8）保持同一节奏
+        self.body.setSpacing(8)
         outer.addLayout(self.body)
 
     def add(self, widget: QWidget) -> None:

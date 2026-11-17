@@ -30,11 +30,16 @@ GRIP_CLOSED = 0.0
 # ~/.cache/openarm_studio/meshes/colors.json，_apply_finishes 还原。
 
 
-def _apply_finishes(xml: str) -> str:
+def _apply_finishes(xml: str, metallic: bool = True) -> str:
     """按 dae 提取的原始配色给 visual geom 绑材质；collision 挪到第 3 组。
 
     颜色来自 urdf2mjcf 转换时写的 colors.json（分片名 → rgb）。
     亮度高的（银色金属件）给金属质感，深色（打印件/电机）给哑光。
+
+    metallic=True 时金属件走「低反射 + 顶格高光」：
+    反射率从 0.8 降到 0.12，因为 mjr 只反射纯色天空盒，高反射会把件
+    照成一片没有棱角的灰；把权重让给 Phong 高光（specular/shininess
+    都顶格，配合 build_spec 里加强的灯光高光），银色件才有明暗分离。
     """
     import json
     import re as _re
@@ -69,7 +74,11 @@ def _apply_finishes(xml: str) -> str:
             # dae 亮色(251/160)→银、深色(63/24/0)→黑；官方就这两档
             if mean > 0.45:
                 rgba = "0.65 0.65 0.65 1"
-                attrs = 'specular="1.0" shininess="0.9" reflectance="0.8"'
+                # 金属件：顶格高光；反射权重在 mjr 里只会照出纯色天空，
+                # 所以金属模式把它压到 0.12，让高光主导明暗。
+                attrs = ('specular="1.0" shininess="1.0" reflectance="0.12"'
+                         if metallic else
+                         'specular="1.0" shininess="0.9" reflectance="0.8"')
             else:
                 rgba = "0.247 0.247 0.247 1"
                 attrs = 'reflectance="0.05" shininess="0.5"'
@@ -161,18 +170,30 @@ def _write_grid_png(path: Path, base_rgb: list[float], line_factor: float,
 def build_spec(urdf_path: Path, *, sky_rgb: list[float], floor_rgb: list[float],
                light_scale: float, haze: float,
                sky_png: Path, grid_png: Path, grid_line: float,
-               floor_reflect: float) -> str:
+               floor_reflect: float, metallic: bool = True) -> str:
     """返回最终 MJCF 文本。
 
     先让 MjSpec 把 URDF 读成 MJCF（这一步它做得好），再把地板/灯光/
     天空盒以文本形式注入——MjSpec.add_texture 实测不会写入 texture 类型，
     而手写标签这条路径完全可控。
+
+    metallic=True 时走「影棚打光」：灯光高光调强、金属件反射率调低。
+    MuJoCo 的 mjr 光栅器不吃 metallic/roughness（实测 mat_metallic 改了
+    没有任何像素变化），金属感只能靠 Phong 高光，所以不能指望天空反射——
+    纯色天空下高 reflectance 只会把件照成一片灰。
+
+    天空保持**纯色**（rgb1=rgb2）：曾试过加纵向渐变，反射层次是多了一点，
+    但背景不再是原来的干净底色，已按用户要求改回。
     """
     spec = MjSpec.from_file(str(urdf_path))
     xml = spec.to_xml()
 
     s = max(0.4, float(light_scale))
     sky = " ".join(f"{v:.4f}" for v in sky_rgb)
+    k_spec = 0.38 if metallic else 0.12
+    f_spec = 0.09 if metallic else 0.03
+    t_spec = 0.06 if metallic else 0.02
+    w_spec = 0.20 if metallic else 0.05
 
     def mat_xml(name: str, p: dict) -> str:
         attrs = " ".join(f'{k}="{v}"' for k, v in p.items())
@@ -191,31 +212,31 @@ def build_spec(urdf_path: Path, *, sky_rgb: list[float], floor_rgb: list[float],
         # 灯光照 pbvs 场景标准：暖调主光(key) + 冷调补光(fill) + 顶光(top)
         # + 工作区聚光(work_spot)，方向光为主、spot 补层次
         '<light name="key" directional="true" pos="0.5 -1.5 2.5" dir="-0.15 0.45 -0.87" '
-        'diffuse="%s %s %s" specular="0.12 0.12 0.12" castshadow="false"/>'
+        'diffuse="%s %s %s" specular="%g %g %g" castshadow="false"/>'
         '<light name="fill" directional="true" pos="-1.5 0.5 2.0" dir="0.55 -0.2 -0.81" '
-        'diffuse="%s %s %s" specular="0.03 0.03 0.03" castshadow="false"/>'
+        'diffuse="%s %s %s" specular="%g %g %g" castshadow="false"/>'
         '<light name="top" directional="true" pos="0 0 3" dir="0 0 -1" '
-        'diffuse="%s %s %s" specular="0.02 0.02 0.02" castshadow="false"/>'
+        'diffuse="%s %s %s" specular="%g %g %g" castshadow="false"/>'
         '<light name="work_spot" pos="0.18 -0.32 2.0" dir="0 0 -1" cutoff="55" '
-        'exponent="1.5" diffuse="%s %s %s" specular="0.05 0.05 0.05" castshadow="false"/>'
+        'exponent="1.5" diffuse="%s %s %s" specular="%g %g %g" castshadow="false"/>'
         '<geom name="floor" type="plane" size="4 4 0.05" pos="0 0 0" '
         'material="floor_mat" contype="0" conaffinity="0"/>'
-        % (0.60 * s, 0.58 * s, 0.53 * s,
-           0.20 * s, 0.22 * s, 0.27 * s,
-           0.15 * s, 0.16 * s, 0.18 * s,
-           0.45 * s, 0.45 * s, 0.45 * s)
+        % (0.60 * s, 0.58 * s, 0.53 * s, k_spec, k_spec, k_spec,
+           0.20 * s, 0.22 * s, 0.27 * s, f_spec, f_spec, f_spec,
+           0.15 * s, 0.16 * s, 0.18 * s, t_spec, t_spec, t_spec,
+           0.45 * s, 0.45 * s, 0.45 * s, w_spec, w_spec, w_spec)
     )
     visual = (
         '<visual><headlight ambient="0.42 0.42 0.44" diffuse="0.55 0.55 0.57" '
         'specular="0 0 0"/>'
-        '<global offwidth="1600" offheight="1200" ipd="0"/>'
+        '<global offwidth="2560" offheight="1440" ipd="0"/>'
         '<map haze="%g" fogstart="1.2" fogend="6"/>'
         '</visual>' % haze
     )
 
     xml = _inject_into(xml, "asset", assets)
     xml = _inject_into(xml, "worldbody", scene)
-    xml = _apply_finishes(xml)
+    xml = _apply_finishes(xml, metallic)
     # 积分器/步长照官方：implicitfast + 1kHz。默认 Euler + 2ms 配
     # kp=230 的伺服会数值发散（表现就是"一点仿真就抖/乱动"）
     if "<option" not in xml:
@@ -278,7 +299,8 @@ def _inject_into(xml: str, tag: str, payload: str) -> str:
 
 
 def build_model(cache_dir: Path, theme_scene: dict, *,
-                bimanual: bool = True, force_rebuild: bool = False) -> mujoco.MjModel:
+                bimanual: bool = True, force_rebuild: bool = False,
+                metallic: bool = True) -> mujoco.MjModel:
     """按主题配色构建模型（主题切换时重建，耗时 ~0.2s）。"""
     cache_dir.mkdir(parents=True, exist_ok=True)
     urdf = prepare_model_file(cache_dir, bimanual=bimanual, force=force_rebuild)
@@ -300,6 +322,7 @@ def build_model(cache_dir: Path, theme_scene: dict, *,
         grid_png=grid_png,
         grid_line=float(theme_scene.get("grid_line", 0.9)),
         floor_reflect=float(theme_scene.get("floor_reflect", 0.1)),
+        metallic=metallic,
     )
     model = mujoco.MjModel.from_xml_string(xml)
     model.vis.global_.ipd = 0.0

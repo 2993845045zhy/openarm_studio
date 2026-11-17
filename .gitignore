@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .cache/
 docs/*.png
+# 示教录制数据属于实验产物，不入库（要备份单独拷）
+records/

@@ -45,6 +45,9 @@ LIGHT = {
     "accent_soft": "#ebf4ff",
     "accent_soft_2": "#dbeafe",
     "accent_border": "#bcd7f7",
+    # 滑块已走过的轨道：深浅模式都用中性色（深白/浅黑），不用强调色。
+    # 关节与夹爪滑块是常驻控件，蓝色在大面积使用时会抢注意力。
+    "slider_fill": "#000000",
     "danger": "#e03131",
     "danger_hover": "#cb2b2b",
     "danger_press": "#b32525",
@@ -118,6 +121,8 @@ DARK = {
     "accent_soft": "#0d2440",
     "accent_soft_2": "#14305c",
     "accent_border": "#1d4a8c",
+    # 深色模式下滑块轨道用白（对应浅色模式的黑）
+    "slider_fill": "#ffffff",
     "danger": "#ff5c5c",
     "danger_hover": "#ff7070",
     "danger_press": "#e64f4f",
@@ -225,6 +230,10 @@ QWidget#windowRoot[maximized="true"] {
     border: none;
 }
 QWidget#shellBody, QScrollArea { background: transparent; }
+/* QScrollArea 的 viewport 默认按 QPalette.Base 填充（深色主题下仍是白），
+   只给 QScrollArea 设透明不够，必须点名 viewport 和里面的内容 widget。 */
+QScrollArea > QWidget > QWidget { background: transparent; }
+QScrollArea#statusScroll { border: none; background: transparent; }
 QWidget#pageRoot { background: transparent; }
 
 QWidget {
@@ -397,6 +406,14 @@ QLabel#jointVal {
     font-family: "JetBrains Mono", "Consolas", "DejaVu Sans Mono", monospace;
     font-weight: 500;
 }
+/* 关节力矩读数：超过额定 60% 转警示色（不是故障，是"这轴在使劲"） */
+QLabel#jointTorque {
+    color: $ink2;
+    font-size: $fs_caption;
+    font-family: "JetBrains Mono", "Consolas", "DejaVu Sans Mono", monospace;
+    font-weight: 400;
+}
+QLabel#jointTorque[warn="true"] { color: $warn; }
 QLabel#jointHint {
     color: $ink2;
     font-size: $fs_sm;
@@ -493,11 +510,38 @@ QLabel#inspSub {
 QStackedWidget#inspectorStack { background: transparent; }
 
 QFrame#sceneFrame {
-    /* 无界融合（pbvs 标准）：无边框无底色，画面与卡片融为一体 */
+    /* pbvs stage-shell 标准：1px 发丝线框把 MuJoCo 画面裱起来 */
     background: transparent;
-    border: none;
+    border: 1px solid $hairline_strong;
     border-radius: 10px;
 }
+
+/* 视口悬浮视角胶囊已移除（改走 Inspector「场景 → 视图」） */
+
+/* ── 滑块（关节/夹爪直控）：4px 凹槽 + 12px 圆头 ── */
+QSlider::groove:horizontal {
+    height: 4px;
+    border-radius: 2px;
+    background-color: $panel_alt;
+    border: 1px solid $hairline;
+}
+QSlider::handle:horizontal {
+    width: 12px;
+    height: 12px;
+    margin: -6px 0;
+    border-radius: 6px;
+    background-color: $panel;
+    border: 1px solid $hairline_strong;
+}
+QSlider::handle:horizontal:hover { background-color: $hover_bg; }
+QSlider::handle:horizontal:pressed { background-color: $selected_bg; }
+QSlider::sub-page:horizontal {
+    background-color: $slider_fill;
+    border-radius: 2px;
+    margin: 0 0 0 2px;
+}
+QSlider::sub-page:horizontal:disabled { background-color: $panel_alt; }
+QSlider:disabled { border: none; }
 
 /* 工具条幽灵按钮（zcode：无边框、hover 变底、选中变底+正常前景） */
 QPushButton#chip {

@@ -19,13 +19,13 @@ import time
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QEasingCurve, Qt, QTimer, QVariantAnimation
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtCore import QEasingCurve, QRectF, Qt, QTimer, QVariantAnimation
+from PySide6.QtGui import QImage, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import QGridLayout, QLabel, QWidget
 
 from ..core.mjview import DEFAULT_VIEW
 
-_POLL_MS = 16
+_POLL_MS = 33          # 30fps：GUI 线程每帧要做缩放/贴图，16ms 会挤占滑块刷新
 _SMOOTH_MS = 8
 _CAM_TAU_S = 0.10
 _CAM_TAU_ZOOM_S = 0.15
@@ -169,9 +169,13 @@ class MujocoViewPanel(QWidget):
         with self._lock:
             st = dict(self._cam_s)
         st["aspect"] = max(0.4, self.width() / max(1, self.height()))
+        st["view_h"] = self.height()
         st["wireframe"] = (not self._intro_done) or self._wireframe
         st["transparent"] = self._transparent
         st["collision"] = self._collision
+        # 标记交给渲染线程画 3D 半透明球（有正确深度遮挡，不像 2D 投影
+        # 随缩放漂移；命中判定也因此稳定）
+        st["marker"] = self._target_world
         return st
 
     # ── 末端目标标记（拖拽规划）──────────────────────
@@ -188,12 +192,16 @@ class MujocoViewPanel(QWidget):
         self._target_world = None
 
     def _project(self, p_world) -> tuple[float, float, float] | None:
-        """世界点 → 面板像素坐标 + 深度（相机基向量投影）。"""
+        """世界点 → 面板像素坐标 + 深度（从相机位置起算）。"""
         with self._lock:
             cam = dict(self._cam_s)
         look = np.array(cam["lookat"], dtype=float)
         fwd, right, up = _cam_basis(cam["azimuth"], cam["elevation"])
-        rel = np.array(p_world, dtype=float) - look
+        # 深度必须从相机位置起算。末端目标常落在 lookat 附近，若按
+        # rel = p - lookat 计算会得到 ~0 深度被 "depth<=0.05" 剔除，
+        # 表现就是：末端拖拽十字标记不显示、鼠标无法命中、拖不动。
+        cam_pos = look - fwd * float(cam["distance"])
+        rel = np.array(p_world, dtype=float) - cam_pos
         depth = float(rel @ fwd)
         if depth <= 0.05:
             return None
@@ -270,11 +278,16 @@ class MujocoViewPanel(QWidget):
             self._xfade_t0 = time.monotonic()
 
     def _cancel_intro(self) -> None:
+        """中止开场运镜。**已结束后不做任何事**——否则每次单击都会把
+
+        相机复位到 home（"单击也回正"的根因）。运镜期间中止才复位。
+        """
+        if self._intro_done:
+            return
         if self._intro.state() == QVariantAnimation.Running:
             self._intro.stop()
-        if not self._intro_done:
-            self._intro_done = True
-            self._xfade_t0 = time.monotonic()
+        self._intro_done = True
+        self._xfade_t0 = time.monotonic()
         with self._lock:
             self._cam = dict(VIEW_PRESETS["home"])
 
@@ -311,7 +324,7 @@ class MujocoViewPanel(QWidget):
             arr = (bg[None, None, :] * (1.0 - a)
                    + arr.astype(np.float32) * a).astype(np.uint8)
 
-        self._draw_target_marker(arr)
+        # 标记已改由渲染线程画 3D 球（mjview._add_marker），这里不再叠 2D 圆
         self._draw_axis_gizmo(arr)
 
         qimg = QImage(arr.data, w, h, w * 3, QImage.Format_RGB888)
@@ -319,8 +332,35 @@ class MujocoViewPanel(QWidget):
         pm = QPixmap.fromImage(qimg)
         target = self.lbl.size()
         if target.width() > 4 and target.height() > 4:
+            # 渲染端做了 1.5× 超采样，这里必须用平滑缩放才能得到抗锯齿效果
             pm = pm.scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            pm = self._round_pixmap(pm)
         self.lbl.setPixmap(pm)
+
+    RADIUS = 10        # 与 QFrame#sceneFrame 的 border-radius 一致
+
+    def _round_pixmap(self, pm: QPixmap) -> QPixmap:
+        """把画面裁成圆角：否则直角图像会盖住 sceneFrame 的圆角边框。
+
+        注意必须**先缩放到 label 实际大小再裁**，且裁剪尺寸要铺满整个
+        label（不留 KeepAspectRatio 的黑边）——黑边区域是直角的，同样会
+        盖住边框。这里把画面居中贴到与 label 等大的透明画布上再整体裁圆角。
+        """
+        tgt = self.lbl.size()
+        out = QPixmap(tgt)
+        out.fill(Qt.transparent)
+        p = QPainter(out)
+        p.setRenderHint(QPainter.Antialiasing, True)
+        # 先设裁剪路径再画图（顺序反了裁剪不生效）
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(0.5, 0.5, tgt.width() - 1.0,
+                                   tgt.height() - 1.0), self.RADIUS, self.RADIUS)
+        p.setClipPath(path)
+        p.drawPixmap((tgt.width() - pm.width()) // 2,
+                     (tgt.height() - pm.height()) // 2, pm)
+        p.end()
+        return out
+        return out
 
     def _draw_axis_gizmo(self, rgb: np.ndarray) -> None:
         """右上角悬浮世界轴（pbvs 同款：3x 超采样、深度排序、预乘合成）。"""
@@ -432,19 +472,34 @@ class MujocoViewPanel(QWidget):
             self._cam_s = cur
 
     # ── 鼠标交互 ──────────────────────────────────────
+    MARKER_RADIUS = 0.035      # 世界坐标半径（与 mjview 里画的球一致）
+
+    def _marker_hit_radius_px(self, depth: float) -> float:
+        """球在屏幕上的像素半径（透视），再留 1.5 倍手感余量。"""
+        half_h = math.tan(math.radians(self._fovy) / 2.0) * max(depth, 1e-3)
+        r_px = self.MARKER_RADIUS / half_h * (self.height() / 2.0)
+        return max(16.0, r_px * 1.5)
+
+    def _marker_hit(self, x: float, y: float) -> bool:
+        if self._target_world is None:
+            return False
+        pr = self._project(self._target_world)
+        if pr is None:
+            return False
+        d = math.hypot(x - pr[0], y - pr[1])
+        return d < self._marker_hit_radius_px(pr[2])
+
     def mousePressEvent(self, ev) -> None:  # noqa: N802
         self._cancel_intro()
-        if ev.button() == Qt.LeftButton and self._target_world is not None:
+        # 左键落在球内 → 拖标记；落在球外 → 旋转视角（RViz 同款语义）
+        if ev.button() == Qt.LeftButton and self._marker_hit(
+                ev.position().x(), ev.position().y()):
             pr = self._project(self._target_world)
-            if pr is not None:
-                dx = ev.position().x() - pr[0]
-                dy = ev.position().y() - pr[1]
-                if (dx * dx + dy * dy) ** 0.5 < 20:
-                    self._drag_marker = True
-                    self._drag_base = (ev.position().x(), ev.position().y(),
-                                       pr[2], tuple(self._target_world))
-                    self.setCursor(Qt.ClosedHandCursor)
-                    return
+            self._drag_marker = True
+            self._drag_base = (ev.position().x(), ev.position().y(),
+                               pr[2], tuple(self._target_world))
+            self.setCursor(Qt.ClosedHandCursor)
+            return
         self._press = (ev.button(), ev.position().x(), ev.position().y())
 
     def mouseReleaseEvent(self, ev) -> None:  # noqa: N802
@@ -474,6 +529,9 @@ class MujocoViewPanel(QWidget):
                 self.on_target_drag(newp, False)
             return
         if self._press is None:
+            # 未拖拽时：悬停在球上给手型提示，明确"这里能拖"
+            self.setCursor(Qt.OpenHandCursor if self._marker_hit(
+                ev.position().x(), ev.position().y()) else Qt.ArrowCursor)
             return
         btn, px, py = self._press
         x, y = ev.position().x(), ev.position().y()
@@ -488,7 +546,8 @@ class MujocoViewPanel(QWidget):
             cam["azimuth"] -= dx * scale
             cam["elevation"] -= dy * scale
             cam["elevation"] = max(_ELEV_CLAMP[0], min(_ELEV_CLAMP[1], cam["elevation"]))
-        elif btn == Qt.RightButton:
+        elif btn in (Qt.RightButton, Qt.MiddleButton):
+            # 右键/中键都是平移（RViz 习惯用中键，保留右键兼容）
             lk = np.array(cam["lookat"], dtype=float)
             az = math.radians(cam["azimuth"])
             right = np.array([math.sin(az), -math.cos(az), 0.0])
