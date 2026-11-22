@@ -1,0 +1,11 @@
+# OpenArm Studio 的 Python 依赖。版本是 2026-11 在 Ubuntu 24.04 / Python 3.12 上验证过的，
+# 其它版本未逐一测试。外部模型（openarm_description、openarm_mujoco）不在这里，见 README「安装」。
+PySide6==6.11.2
+mujoco==3.12.0
+numpy==2.5.2
+trimesh==5.1.0
+pycollada==0.9.3
+opencv-python==5.0.0.93
+openarm-driver==0.5.1
+openarm-can==1.4.1
+openarm-control==0.6.0

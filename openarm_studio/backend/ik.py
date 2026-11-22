@@ -17,7 +17,9 @@ from pathlib import Path
 
 import numpy as np
 
-V1_XML = Path.home() / "openarm_ws/official_openarm_mujoco/v1/openarm_bimanual.xml"
+from ..paths import mujoco_v1_xml
+
+V1_XML = mujoco_v1_xml()
 
 
 class ArmIK:

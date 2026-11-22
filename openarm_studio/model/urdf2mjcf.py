@@ -12,19 +12,67 @@ MuJoCo 的 URDF 支持有三个硬性限制，这里逐条处理：
 
 from __future__ import annotations
 
-import os
+import hashlib
 import re
 from pathlib import Path
+
+from ..paths import mesh_dirs
 
 BIMANUAL_URDF = Path(__file__).with_name("assets") / "openarm_v10_bimanual.urdf"
 
 
+def _layout(root: Path) -> str | None:
+    """openarm_description 两代布局：meshes/（记作 legacy）和 assets/（记作 main）。"""
+    if (root / "arm/v10").is_dir():
+        return "legacy"
+    if (root / "arm/openarm_v1.0").is_dir():
+        return "main"
+    return None
+
+
+def _to_main_layout(fname: str) -> str:
+    """随附 URDF 里的路径（按旧版 meshes/ 布局写的）→ main 分支 assets/ 下的路径。"""
+    parts = fname.split("/")
+    name = parts[-1]
+    if parts[:2] == ["arm", "v10"]:
+        if name.startswith("link7"):
+            # 腕部末节归在末端执行器目录下，碰撞网格也不带 _symp 后缀
+            name = "link7.stl" if name == "link7_symp.stl" else name
+            return f"end_effector/parallel_link/meshes/{parts[2]}/{name}"
+        return f"arm/openarm_v1.0/meshes/{parts[2]}/{name}"
+    if parts[:2] == ["body", "v10"]:
+        return f"body/v1.0/meshes/{parts[2]}/{name}"
+    if parts[:2] == ["ee", "openarm_hand"]:
+        return f"end_effector/parallel_link/meshes/{parts[2]}/{name}"
+    return fname
+
+
+def mesh_dir_available() -> bool:
+    try:
+        _mesh_dir()
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def _mesh_dir() -> Path:
-    default_dir = Path.home() / "openarm_ws/src/openarm_description/meshes"
-    mesh_dir = Path(os.environ.get("OPENARM_MESH_DIR", default_dir)).expanduser()
-    if not mesh_dir.is_dir():
-        raise FileNotFoundError(f"找不到 OpenArm v1.0 网格目录：{mesh_dir}。可设置 OPENARM_MESH_DIR。")
-    return mesh_dir.resolve()
+    """能认出布局的第一个网格根目录。"""
+    for root in mesh_dirs():
+        if _layout(root):
+            return root.resolve()
+    first = mesh_dirs()[0]
+    raise FileNotFoundError(f"找不到 OpenArm v1.0 网格（在 {first} 及其 meshes/、assets/ 下都没找到）。"
+                            "请按 README「安装」克隆 openarm_description，"
+                            "或设置 OPENARM_MESH_DIR 指向它。")
+
+
+def _mirror_path(src: Path) -> Path:
+    """镜像副本的位置。dae 分片本来就在缓存里，原地加 _m 后缀；取自 openarm_description
+    的碰撞网格镜像到缓存，不往别人的仓库里写生成文件。"""
+    if src.parent == _mesh_cache():
+        return src.with_name(src.stem + "_m.stl")
+    key = hashlib.sha256(str(src).encode()).hexdigest()[:10]
+    return _mesh_cache() / f"{src.stem}_m_{key}.stl"
 
 
 def _mirror_shards(shards: list[Path]) -> list[Path]:
@@ -40,7 +88,7 @@ def _mirror_shards(shards: list[Path]) -> list[Path]:
 
     outs = []
     for src in shards:
-        dst = src.with_name(src.stem + "_m.stl")
+        dst = _mirror_path(src)
         if not dst.exists():
             g = trimesh.load(str(src), force="mesh")
             g.apply_transform(np.diag([1.0, -1.0, 1.0, 1.0]))
@@ -51,11 +99,16 @@ def _mirror_shards(shards: list[Path]) -> list[Path]:
 
 def _mesh_rewrite(text: str, mesh_dir: Path) -> str:
     """路径改写 + dae→stl + 负 scale 烘焙成镜像文件。"""
+    layout = _layout(mesh_dir)
+
+    def locate(fname: str) -> Path:
+        rel = _to_main_layout(fname) if layout == "main" else fname
+        return mesh_dir / rel
 
     def repl(m: re.Match[str]) -> str:
         fname, scale = m.group(1), m.group(2)
         negate = scale is not None and "-" in scale
-        src = mesh_dir / fname
+        src = locate(fname)
         shards: list[Path] | None = None
         if src.suffix.lower() == ".dae":
             try:
@@ -63,16 +116,14 @@ def _mesh_rewrite(text: str, mesh_dir: Path) -> str:
             except Exception:  # noqa: BLE001
                 shards = None
         if shards is None:
-            if src.suffix.lower() == ".stl" and src.exists():
-                shards = [src]
-            else:
-                for cand in (src.with_suffix(".stl"),
-                             Path(str(src).replace("/visual/", "/collision/")).with_suffix(".stl")):
-                    if cand.exists():
-                        shards = [cand]
-                        break
+            stem = fname.rsplit(".", 1)[0]
+            for cand in (locate(stem + ".stl"),
+                         locate(stem.replace("/visual/", "/collision/") + ".stl")):
+                if cand.exists():
+                    shards = [cand]
+                    break
         if shards is None:
-            raise FileNotFoundError(f"缺少 OpenArm 网格：{src}")
+            raise FileNotFoundError(f"缺少 OpenArm 网格：{fname}（网格根目录 {mesh_dir}）")
         if negate:
             shards = _mirror_shards(shards)
         pos_scale = scale.replace("-", "") if scale else scale
@@ -110,8 +161,6 @@ def _convert_dae(src: Path) -> list[Path]:
 
     分片命名 {stem}_{idx}_{hash}.stl；同前缀即同源。
     """
-    import hashlib
-
     key = hashlib.sha256(str(src).encode()).hexdigest()[:10]
     prefix = f"{src.stem}"
     out_dir = _mesh_cache()

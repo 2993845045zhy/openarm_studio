@@ -24,8 +24,13 @@ from PySide6.QtWidgets import QApplication, QPushButton
 from PySide6.QtTest import QTest
 
 from openarm_studio.backend.teleop import JointFeedback
+from openarm_studio.model.urdf2mjcf import mesh_dir_available
 from openarm_studio.ui.shell import StudioWindow
 from openarm_studio.ui.switch import ModeSwitch
+
+# 主窗口会构建 3D 模型，渲染网格来自外部仓库 openarm_description（见 README「安装」）。
+pytestmark = pytest.mark.skipif(not mesh_dir_available(),
+                                reason="缺少 OpenArm 渲染网格（openarm_description/meshes）")
 
 
 @pytest.fixture(scope="module")

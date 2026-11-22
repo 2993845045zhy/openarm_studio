@@ -1512,10 +1512,9 @@ class StudioWindow(QMainWindow):
     def _ensure_ik(self):
         if getattr(self, "_ik", None) is None:
             try:
-                from ..backend.ik import ArmIK
+                from ..backend.ik import V1_XML, ArmIK
                 if not ArmIK.available():
-                    self._log("IK 不可用：缺少官方 v1 MuJoCo 模型"
-                              "（~/openarm_ws/official_openarm_mujoco/v1）")
+                    self._log(f"IK 不可用：缺少官方 v1 MuJoCo 模型（{V1_XML}）")
                     return None
                 self._ik = ArmIK.shared()
                 self._log("IK 就绪（官方 openarm_control + v1 模型）")
@@ -2330,8 +2329,8 @@ class StudioWindow(QMainWindow):
             self._log("CAN 重连：接口已重置，开始重新连接…")
             QTimer.singleShot(300, self._connect)
         else:
-            self._log("CAN 重连：重置未成功（可手动执行 "
-                      "sudo bash /usr/local/sbin/openarm-can-up.sh can0）")
+            self._log(f"CAN 重连：重置未成功（可手动执行 "
+                      f"sudo bash {self.CAN_RESET_SCRIPT}）")
 
     def _on_bus_result(self, res: dict) -> None:
         self._probing = False

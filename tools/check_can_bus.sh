@@ -3,8 +3,9 @@
 # 用法：bash check_can_bus.sh            （can0/can1 都测）
 #       bash check_can_bus.sh can1       （只测左臂）
 # 判读：无应答表示未收到匹配的电机状态帧。先区分发送队列满和成功发送后无回包。
-PY="$HOME/anaconda3/envs/ros2ws/bin/python"
-[ -x "$PY" ] || { echo "找不到 $PY"; exit 1; }
+# shellcheck source=python_env.sh
+source "$(dirname "$(readlink -f "$0")")/python_env.sh"
+PY="$(studio_python)" || { echo "找不到 Python（可用 OPENARM_STUDIO_PYTHON 指定）"; exit 1; }
 exec "$PY" - "$@" <<'EOF'
 import sys
 import time

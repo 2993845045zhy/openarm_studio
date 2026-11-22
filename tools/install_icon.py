@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""把 SVG 渲染成多尺寸 PNG（供 dock / 任务栏图标使用）。"""
+"""把 SVG 渲染成多尺寸 PNG（供 dock / 任务栏图标使用）。
+
+写入 $XDG_DATA_HOME/icons/hicolor（默认 ~/.local/share/icons/hicolor）。
+"""
+import os
 import sys
 from pathlib import Path
 
@@ -10,7 +14,7 @@ from PySide6.QtWidgets import QApplication
 
 ROOT = Path(__file__).resolve().parents[1]
 SVG = ROOT / "openarm_studio/ui/assets/openarm_studio.svg"
-OUT = Path.home() / ".local/share/icons/hicolor"
+OUT = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))) / "icons/hicolor"
 
 
 def render(size: int, out: Path) -> None:

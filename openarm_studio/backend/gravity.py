@@ -19,6 +19,8 @@ from pathlib import Path
 
 import numpy as np
 
+from ..paths import mujoco_v1_xml
+
 GRAVITY = (0.0, 0.0, -9.81)
 _BASE_LINK = "openarm_body_link0"
 _JOINTS_PER_ARM = 7
@@ -90,9 +92,7 @@ class GravityModel:
     _lock = threading.Lock()
 
     # 官方 v1 MuJoCo 模型位置（enactic/openarm_mujoco 仓库）
-    MUJOCO_CANDIDATES = (
-        Path.home() / "openarm_ws/official_openarm_mujoco/v1/openarm_bimanual.xml",
-    )
+    MUJOCO_CANDIDATES = (mujoco_v1_xml(),)
 
     @classmethod
     def shared(cls) -> "GravityModel":

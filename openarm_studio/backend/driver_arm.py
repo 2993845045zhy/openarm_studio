@@ -126,8 +126,9 @@ class _Cmd:
 # ── 总线体检（只读，随时可调用，与已连接的臂共存）────────────
 _PROBE_TYPES = None      # 延迟初始化（避免 import 时强依赖 openarm_can）
 
-_UP_HINT = ("sudo bash ~/openarm_ws/src/openarm_can/setup/"
-            "configure_socketcan.sh {iface} -fd")
+_UP_HINT = ("sudo ip link set dev {iface} down && sudo ip link set dev {iface} type can "
+            "bitrate 1000000 sample-point 0.75 dbitrate 5000000 dsample-point 0.75 fd on "
+            "&& sudo ip link set dev {iface} up")
 
 
 def can_ifstate(iface: str) -> dict:

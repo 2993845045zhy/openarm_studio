@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """P1 自检：构建双臂模型并离屏渲染一张图。
 
-用法:
-    MUJOCO_GL=egl ~/anaconda3/envs/ros2ws/bin/python tools/render_test.py [theme]
+用法（Python 需装好 requirements.txt，可改用 OPENARM_STUDIO_PYTHON 指定）:
+    MUJOCO_GL=egl python tools/render_test.py [theme]
 """
 import os
 import sys
