@@ -15,7 +15,7 @@ from mujoco import MjSpec
 
 from .urdf2mjcf import prepare_model_file
 
-# ── 关节契约（与 ros2_control / MoveIt 完全一致）────────────────
+# ── 关节契约────────────────
 LEFT_ARM = [f"openarm_left_joint{i}" for i in range(1, 8)]
 RIGHT_ARM = [f"openarm_right_joint{i}" for i in range(1, 8)]
 LEFT_GRIP = ["openarm_left_finger_joint1"]
@@ -299,11 +299,10 @@ def _inject_into(xml: str, tag: str, payload: str) -> str:
 
 
 def build_model(cache_dir: Path, theme_scene: dict, *,
-                bimanual: bool = True, force_rebuild: bool = False,
                 metallic: bool = True) -> mujoco.MjModel:
     """按主题配色构建模型（主题切换时重建，耗时 ~0.2s）。"""
     cache_dir.mkdir(parents=True, exist_ok=True)
-    urdf = prepare_model_file(cache_dir, bimanual=bimanual, force=force_rebuild)
+    urdf = prepare_model_file(cache_dir)
 
     sky_rgb = [float(v) for v in theme_scene["sky_top"].split()]
     floor_rgb = [float(v) for v in theme_scene["sky_floor"].split()] \

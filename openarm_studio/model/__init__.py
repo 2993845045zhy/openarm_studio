@@ -1,1 +1,1 @@
-"""机器人模型：xacro/URDF → MuJoCo。"""
+"""OpenArm 双臂模型与 MuJoCo 场景。"""

@@ -2,7 +2,7 @@
 # 双臂 CAN 总线体检：对每条总线的 7 个电机轴发 5 轮查询，报应答数。
 # 用法：bash check_can_bus.sh            （can0/can1 都测）
 #       bash check_can_bus.sh can1       （只测左臂）
-# 判读：❌ 无应答 = 总线上没有任何设备 ACK（断电/急停/线断），软件层已无嫌疑。
+# 判读：无应答表示未收到匹配的电机状态帧。先区分发送队列满和成功发送后无回包。
 PY="$HOME/anaconda3/envs/ros2ws/bin/python"
 [ -x "$PY" ] || { echo "找不到 $PY"; exit 1; }
 exec "$PY" - "$@" <<'EOF'
@@ -28,6 +28,7 @@ for iface in IFS:
             o.refresh_all()
             o.recv_all(first_timeout_us=100_000)
             time.sleep(0.1)
+        o.recv_all(first_timeout_us=10_000)
         per = []
         alive = 0
         for i in range(7):
@@ -35,13 +36,16 @@ for iface in IFS:
             per.append(f"J{i+1} {ls.responses}/{ls.commands_sent}")
             alive += ls.responses > 0
         print("  各轴 应答/发送:", "  ".join(per))
-        if alive >= 5:
+        queue_full = o.get_bus_status().write_no_buffer.count
+        if queue_full:
+            print(f"  结论: 发送队列满 {queue_full} 次，{alive}/7 轴有状态回包")
+        elif alive == 7:
             pos = [round(m.get_position(), 3) for m in o.get_arm().get_motors()]
             print(f"  结论: 在线 ✅  位置(rad): {pos}")
         elif alive == 0:
-            print("  结论: ❌ 0/7 应答 —— 总线上没有设备 ACK（查供电/急停/CAN 线）")
+            print("  结论: ❌ 0/7 轴有状态回包（查供电、急停、CAN 线和电机 ID）")
         else:
-            print(f"  结论: ⚠️ 部分在线 {alive}/7 —— 有电机掉链或损坏")
+            print(f"  结论: ⚠️ 部分在线 {alive}/7")
         del o
     except Exception as exc:  # noqa: BLE001
         print(f"  ❌ 打不开接口: {type(exc).__name__}: {exc}")

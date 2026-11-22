@@ -2,7 +2,7 @@
 """重力模型（官方 KDL 栈）单元测试。
 
 验证：链构造正确、重力矩随姿态平滑变化、左右臂镜像互补。
-不接触硬件；首次运行会跑一次 xacro（约 1~2s）。
+不接触硬件。
 """
 import sys
 from pathlib import Path
@@ -12,7 +12,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-sys.path.append("/usr/lib/python3/dist-packages")   # 系统 PyKDL（ROS 2 同源）
+sys.path.append("/usr/lib/python3/dist-packages")   # 系统 PyKDL
 
 pytest.importorskip("PyKDL")
 pytest.importorskip("urdf_parser_py")

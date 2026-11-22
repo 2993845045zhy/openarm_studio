@@ -491,7 +491,7 @@ class MujocoViewPanel(QWidget):
 
     def mousePressEvent(self, ev) -> None:  # noqa: N802
         self._cancel_intro()
-        # 左键落在球内 → 拖标记；落在球外 → 旋转视角（RViz 同款语义）
+        # 左键落在球内 → 拖标记；落在球外 → 旋转视角
         if ev.button() == Qt.LeftButton and self._marker_hit(
                 ev.position().x(), ev.position().y()):
             pr = self._project(self._target_world)
@@ -547,7 +547,7 @@ class MujocoViewPanel(QWidget):
             cam["elevation"] -= dy * scale
             cam["elevation"] = max(_ELEV_CLAMP[0], min(_ELEV_CLAMP[1], cam["elevation"]))
         elif btn in (Qt.RightButton, Qt.MiddleButton):
-            # 右键/中键都是平移（RViz 习惯用中键，保留右键兼容）
+            # 右键/中键都是平移
             lk = np.array(cam["lookat"], dtype=float)
             az = math.radians(cam["azimuth"])
             right = np.array([math.sin(az), -math.cos(az), 0.0])

@@ -136,7 +136,7 @@ class MjEmbedRenderer:
 
     @staticmethod
     def _add_marker(scn, marker) -> None:
-        """在场景里加 RViz 式末端标记：半透明球 + 三轴箭头。
+        """在场景里加 末端标记：半透明球 + 三轴箭头。
 
         marker: (x, y, z) 世界坐标；None 时不画。
         用 MuJoCo 原生 mjv_initGeom 追加几何——有正确的深度遮挡与透视，

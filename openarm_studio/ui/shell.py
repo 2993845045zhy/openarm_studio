@@ -15,18 +15,20 @@ from pathlib import Path
 
 import mujoco
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import QSignalBlocker, Qt, QTimer, Signal
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (QComboBox, QFrame, QHBoxLayout, QLabel,
                                QMainWindow, QPlainTextEdit, QPushButton,
-                               QScrollArea, QSlider, QSplitter, QTabWidget,
+                               QScrollArea, QSlider, QSpinBox, QSplitter, QTabWidget,
                                QVBoxLayout, QWidget)
 
 from ..core.mjview import MjEmbedRenderer
 from ..core.sim import SimBackend
 from ..model import scene as model_scene
 from ..backend.driver_arm import (CONFIGS, GRIP_OPEN_M as GRIP_OPEN, DriverArm,
+                                  MANUAL_JOINT_SPEED_RAD_S, SLIDER_JOINT_SPEED_LIMITS_RAD_S,
                                   can_ifstate, probe_bus)
+from ..backend.teleop import BimanualTeleop, JointFeedback
 from .chrome import DragHandle, ResizeHandles, WindowButtons
 from .icons import ICONS
 from .mjview_panel import MujocoViewPanel
@@ -71,10 +73,6 @@ class RenderWorker(threading.Thread):
         self.data: mujoco.MjData | None = None
         self.sim: SimBackend | None = None
         self._qmap: dict[str, int] = {}
-        # 轨迹播放（MoveIt 规划结果的 3D 预览）
-        self._traj: list[dict[str, float]] = []
-        self._traj_i = 0
-        self._traj_hold = 0.0
 
     # ── 外部接口（线程安全）────────────────────────────
     def set_pose(self, positions: dict[str, float]) -> None:
@@ -103,22 +101,6 @@ class RenderWorker(threading.Thread):
         pos = tuple(float(v) for v in data.xpos[bid])
         quat = tuple(float(v) for v in data.xquat[bid])
         return pos, quat
-
-    def play_trajectory(self, names: list[str], points: list[list[float]],
-                        speed: float = 0.5) -> None:
-        """把规划轨迹转成「关节名→角度」序列，交给渲染循环逐帧播放。"""
-        frames = []
-        for p in points:
-            frames.append({n: float(v) for n, v in zip(names, p)})
-        with self._lock:
-            self._traj = frames
-            self._traj_i = 0
-            self._traj_hold = 0.0
-        self._speed = max(0.1, float(speed))
-
-    def stop_trajectory(self) -> None:
-        with self._lock:
-            self._traj = []
 
     def set_theme(self, theme_name: str) -> None:
         with self._lock:
@@ -170,18 +152,6 @@ class RenderWorker(threading.Thread):
                     self._pending_sync = False
                 assert self.model is not None and self.data is not None
 
-                # 轨迹预览优先：逐帧喂姿态（不跑物理）
-                with self._lock:
-                    traj = self._traj
-                    ti = self._traj_i
-                if traj and ti < len(traj):
-                    pose = traj[ti]
-                    with self._lock:
-                        self._traj_i = ti + 1
-                        self._pose = dict(pose)
-                        self._latest = dict(pose)
-                    mode = "twin"
-
                 if mode == "sim" and self.sim is not None:
                     if pending_sync:
                         # 切进仿真：伺服目标钉在当前姿态再预热，
@@ -226,8 +196,10 @@ class RenderWorker(threading.Thread):
 # ────────────────────────────────────────────────────────────
 class StudioWindow(QMainWindow):
     log_sig = Signal(str)
-    conn_sig = Signal(bool, str)
+    conn_sig = Signal(dict, str)
+    reset_sig = Signal(bool)
     probe_sig = Signal(dict)
+    travel_sig = Signal(int, str, bool)  # 走位代次、臂、结果
 
     def __init__(self, theme_name: str = "dark"):
         super().__init__()
@@ -236,13 +208,14 @@ class StudioWindow(QMainWindow):
         self._worker: RenderWorker | None = None
         # SDK 直连双臂：left→can1, right→can0（与 bringup 约定一致）
         self.arms: dict[str, DriverArm] = {}
-        self._cmd_rate_hz = 50.0     # 滑块下发频率
         self._local_pose: dict[str, float] = {}
         self.nav_items: list[NavItem] = []
         self._switches: list[Switch] = []
         self._pal_now = palette(theme_name)
         self._conn_state = "disconnected"
+        self._can_resetting = False
         self._cmd_pose: dict[str, float] = {}
+        self._slider_target_sides: set[str] = set()
 
         self.setWindowTitle("OpenArm Studio")
         # 默认高度 1060：状态列（关节控制 + 力控含两个参数滑块 + 夹爪）
@@ -256,9 +229,19 @@ class StudioWindow(QMainWindow):
         # 日志/连接信号先接好：构建与渲染线程的启动期消息也能进日志页
         self.log_sig.connect(self._append_log)
         self.conn_sig.connect(self._on_conn_result)
+        self.reset_sig.connect(self._can_reset_done)
         self.probe_sig.connect(self._on_bus_result)
+        self.travel_sig.connect(self._on_arm_travel_done)
         self._probing = False
         self._traveling = False
+        self._disabling = False
+        self._enabling = False
+        self._travel_id = 0
+        self._travel_arms: set[str] = set()
+        self._travel_ok = True
+        self._teleop_session: BimanualTeleop | None = None
+        self._teleop_stop_reason: str | None = None
+        self._grip_options: dict[str, tuple[QSpinBox, QPushButton, QPushButton, QLabel]] = {}
         self._ik = None
         self._ee_drag_on = False
         self._pending_sliders: set[str] = set()   # 已下发目标、等待实测追上
@@ -268,8 +251,12 @@ class StudioWindow(QMainWindow):
         self._rec_t0 = 0.0
         # 示教回放状态
         self._play_rows: list[list[float]] = []
+        self._play_live_sides: set[str] = set()
+        self._after_disable: str | None = None
+        self._estopping = False
         self._play_i = 0
         self._play_t0 = 0.0
+        self._play_last_tick = 0.0
         self._play_dur = 0.0
         self._play_timer = QTimer(self)
         self._play_timer.setInterval(20)
@@ -279,7 +266,6 @@ class StudioWindow(QMainWindow):
         self._apply_theme(theme_name, animate=False)
         self._goto_page(0)
         self._start_render()
-        self._start_bridge()
 
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(200)
@@ -290,12 +276,12 @@ class StudioWindow(QMainWindow):
         self._pose_timer.setInterval(20)
         self._pose_timer.timeout.connect(self._push_pose)
         self._pose_timer.start()
-        # 仿真模式要按 50Hz 发 /joint_states（MoveIt/RViz 依赖这个频率）
-        self._pub_timer = QTimer(self)
-        self._pub_timer.setInterval(20)
-        self._pub_timer.timeout.connect(self._publish_sim_state)
-        self._pub_timer.start()
-        # 控制器状态轮询（2s，走 controller_manager 服务）
+        # 每 20ms 提交一次最新的真机目标。
+        self._target_timer = QTimer(self)
+        self._target_timer.setInterval(20)
+        self._target_timer.timeout.connect(self._send_live_targets)
+        self._target_timer.start()
+        # 定期刷新双臂诊断状态。
         self._ctrl_timer = QTimer(self)
         self._ctrl_timer.setInterval(2000)
         self._ctrl_timer.timeout.connect(self._poll_controllers)
@@ -413,6 +399,14 @@ class StudioWindow(QMainWindow):
         self.btn_enable.setVisible(False)
         self.btn_enable.clicked.connect(self._on_enable_toggle)
         lay.addWidget(self.btn_enable)
+
+        self.btn_retry_enable = QPushButton("重试未使能臂", nav)
+        self.btn_retry_enable.setObjectName("btnSecondary")
+        self.btn_retry_enable.setCursor(Qt.PointingHandCursor)
+        self.btn_retry_enable.setToolTip("只对未使能的机械臂发起启动走位")
+        self.btn_retry_enable.hide()
+        self.btn_retry_enable.clicked.connect(self._on_retry_enable)
+        lay.addWidget(self.btn_retry_enable)
 
         # 可折叠分组 + 图标导航行
         self.nav_groups: list[tuple[NavGroupHeader, list[NavItem]]] = []
@@ -798,14 +792,6 @@ class StudioWindow(QMainWindow):
         self._worker.start()
         self._worker.set_pose({})
 
-    def _start_bridge(self) -> None:
-        """SDK 直连（无 ROS）。连接由用户点「连接」触发，这里只绑按钮。"""
-        self._bind_actions()
-
-    # ── 连接状态机（SDK 直连 CAN，无 ROS）───────────────
-    def _bind_actions(self) -> None:
-        self.btn_connect.setEnabled(True)
-
     @property
     def _connected(self) -> bool:
         return self._conn_state == "connected"
@@ -815,7 +801,7 @@ class StudioWindow(QMainWindow):
         self.btn_connect.setText({
             "disconnected": "连接", "connecting": "连接中…", "connected": "断开",
         }.get(state, "连接"))
-        self.btn_connect.setEnabled(state != "connecting")
+        self.btn_connect.setEnabled(state != "connecting" and not self._power_motion_pending)
         self.btn_estop.setEnabled(state == "connected" and not self._is_sim)
         self.sum_rows["状态"].setText(text)
         color = {"disconnected": self._pal_now["muted"],
@@ -833,127 +819,187 @@ class StudioWindow(QMainWindow):
         """连接：仿真=本地 MuJoCo（不碰 CAN）；真机=SDK 直连 can0/can1。"""
         if self._conn_state != "disconnected":
             return
+        if self._probing and not self._is_sim:
+            self._log("请等待总线体检结束后再连接")
+            return
         if self._is_sim:
             self._set_conn_state("connected", "仿真已就绪")
             self._log("仿真模式：MuJoCo 本地物理，无需连接硬件")
             return
         self._set_conn_state("connecting", "连接中…")
-        threading.Thread(target=self._connect_worker, daemon=True,
+        config_name = self.combo_config.currentText()
+        threading.Thread(target=self._connect_worker, args=(config_name,), daemon=True,
                          name="sdk-connect").start()
 
-    def _connect_worker(self) -> None:
+    def _connect_worker(self, config_name: str) -> None:
         """后台连两条臂（打开 CAN + 轮询线程），成功后**不自动使能**。
 
         0 应答的总线在 DriverArm.connect 里直接判失败（不再出现
         "已连接"假象），这里按臂汇总结果。
         """
         names = {"right": "右臂", "left": "左臂"}
-        ok_sides, fail_sides = [], []
+        connected, failed = {}, []
         for side, can_if in (("right", "can0"), ("left", "can1")):
-            arm = DriverArm(side, can_if,
-                            config_name=self.combo_config.currentText()
-                            if hasattr(self, "combo_config") else CONFIGS[0],
-                            on_log=lambda m: self.log_sig.emit(m))
+            arm = DriverArm(side, can_if, config_name=config_name, on_log=self.log_sig.emit)
             if arm.connect():
-                self.arms[side] = arm
-                ok_sides.append(side)
-                # 把当前「力控」开关状态同步到新连上的臂：
-                # 摩擦补偿默认开；关节阻抗若已开则按当前刚度/阻尼挂上
-                arm.set_friction_comp(bool(self.sw_friction.isChecked()))
-                if self.sw_jimp.isChecked():
-                    arm.set_joint_impedance(
-                        True, stiffness=self._imp_stiffness(),
-                        zeta=self._imp_zeta())
+                connected[side] = arm
             else:
-                fail_sides.append(side)
-        # 等轮询出数据再报成功
-        if ok_sides:
-            t0 = time.time()
-            while time.time() - t0 < 5.0:
-                live = [a for a in (self.arms.get(s) for s in ok_sides)
-                        if a is not None and a.positions()]
-                if live:
-                    break
-                time.sleep(0.2)
-        if ok_sides and not fail_sides:
+                failed.append(side)
+        if connected and not failed:
             text = "已连接（双臂）"
-        elif ok_sides:
-            text = (f"{ '、'.join(names[s] for s in ok_sides) }已连接；"
-                    f"{ '、'.join(names[s] for s in fail_sides) }失败（总线无应答，见日志）")
+        elif connected:
+            text = f"{'、'.join(names[side] for side in connected)}已连接；另一臂连接失败"
         else:
-            text = "连接失败（总线无应答，见日志；可用「总线体检」定位）"
-        self.conn_sig.emit(bool(ok_sides), text)
+            text = "连接失败（总线无应答，可用「总线体检」定位）"
+        self.conn_sig.emit(connected, text)
 
-    def _on_conn_result(self, ok: bool, text: str) -> None:
-        if ok:
+    def _on_conn_result(self, arms: dict[str, DriverArm], text: str) -> None:
+        self.arms.update(arms)
+        if arms:
             self._set_conn_state("connected", "已连接")
-            self._log(f"{text}：CAN 总线在线。注意电机未使能——"
-                      "点「使能」才上力矩（start 含起始轨迹，真机请先确认臂周围安全）")
+            for side, arm in arms.items():
+                arm.set_friction_comp(self.sw_friction.isChecked())
+                arm.set_gripper_force(self._grip_options[side][0].value())
+                self._send_force_mode(arm, self._selected_force_mode())
+            self._log(f"{text}：点「使能」后带重力前馈走到起始位")
             self.btn_enable.setText("使能")
             self.btn_enable.setVisible(not self._is_sim)
         else:
             self._set_conn_state("disconnected", "未连接")
-            self._log(f"{text}")
+            self._log(text)
+
+    def _has_enabled_arms(self) -> bool:
+        return any(arm.connected and arm.enabled for arm in self.arms.values())
 
     def _disconnect(self) -> None:
+        if self._power_motion_pending or self._estopping:
+            return
+        if self._has_enabled_arms():
+            self._after_disable = "disconnect"
+            self._on_enable_toggle()
+            return
+        self._stop_teleop("断开连接")
         self._set_conn_state("connecting", "断开中…")
         self._stop_teach_play("断开连接")
         if self._recording:
             self._stop_record()             # 断开前把已录的帧落盘
         for side, arm in list(self.arms.items()):
             arm.disconnect()
-            del self.arms[side]
-        self._set_conn_state("disconnected", "未连接")
-        self.btn_enable.setVisible(False)
-        self._log("已断开（电机失能，进程无残留）")
+            if not arm.connected:
+                del self.arms[side]
+        self._after_travel(False)
+        self._clear_motion_targets()
+        self._set_force_switches("position")
+        if self.arms:
+            self._set_conn_state("connected", "驱动正在退出")
+            self._log("控制线程尚未退出，请稍后重试断开")
+        else:
+            self._set_conn_state("disconnected", "未连接")
+            self.btn_enable.setVisible(False)
+            self._log("已断开")
+        self._update_power_controls()
 
     def _on_estop(self) -> None:
         """急停：立即 disable_all，无回程轨迹。真机注意手臂会失去力矩下垂。"""
         if not self.arms:
             self._log("急停：未连接")
             return
-        self._stop_teach_play("急停")      # 回放必须立刻停，否则会继续下发目标
-        if self._recording:
-            self._stop_record()             # 急停前先把已录的帧落盘
         for arm in self.arms.values():
             arm.estop()
+        self._stop_teleop("急停")
+        self._stop_teach_play("急停", hold=False)
+        self._clear_motion_targets()
+        self._travel_id += 1
+        self._travel_arms.clear()
+        self._enabling = self._disabling = self._traveling = False
+        self._after_disable = None
+        self._estopping = True
+        self._set_force_switches("position")
+        if self._recording:
+            self._stop_record()
         self._set_conn_state("connected", "急停")
-        self._log("急停已执行：双臂立即失能（无回程轨迹，扶稳）")
+        self._update_power_controls()
+        self._log("已请求急停")
+
+    @property
+    def _power_motion_pending(self) -> bool:
+        return self._enabling or self._disabling
 
     def _on_enable_toggle(self) -> None:
-        on = any(a.enabled for a in self.arms.values())
-        for arm in self.arms.values():
-            if on:
-                arm.disable()      # stop()：回程轨迹 + 失能
-            else:
-                arm.enable()       # start()：使能 + 走起始轨迹（臂会动！）
-        self.btn_enable.setText("失能" if not on else "使能")
-        self.sum_rows["状态"].setText("已连接·已使能" if not on else "已连接·未使能")
-        if on:
-            # 失能：清掉目标，避免下次使能后 50Hz 定时器把旧目标发下去；
-            # 重力补偿/示教也随之关闭（失能状态下没有意义）
-            self._stop_teach_play("失能")
-            if self._recording:
-                self._stop_record()
-            self._cmd_pose.clear()
-            self._pending_sliders.clear()
-            self.sw_gravity.setChecked(False)
-            self.sw_teach.setChecked(False)
-            self.sw_jimp.setChecked(False)
-            self._log("失能指令已下发（stop：回程轨迹后失能）；已清空旧目标")
-        else:
-            # 使能：清空目标，之后**不再自动填回**。
-            # 起始轨迹由 driver 自己跑完并保持（它内部把 last_command 设成
-            # 起始位）；此处若按"4 秒后对齐实测"填 _cmd_pose，一旦轨迹尚未
-            # 走完就会把下垂姿态当成目标发下去，臂便停在失能后的位置。
-            # 用户拖滑块时 `_on_slider` 会重新填入目标，届时才恢复下发。
-            self._cmd_pose.clear()
-            self._pending_sliders.clear()
-            self._log("使能指令已下发（start：会上力矩并走起始轨迹，臂会动；"
-                      "轨迹结束后保持起始位，拖滑块才重新接管）")
+        if self._power_motion_pending or self._estopping or self._is_sim:
+            return
+        live = {side: arm for side, arm in self.arms.items() if arm.connected}
+        if not live:
+            return
+        if not any(arm.enabled for arm in live.values()):
+            self._begin_enable(live)
+            return
+        self.sw_ee_drag.setChecked(False)
+        self._clear_motion_targets(hold=True)
+        self._stop_teleop("失能")
+        self._stop_teach_play("失能")
+        if self._recording:
+            self._stop_record()
+        self._disabling = True
+        self._update_power_controls()
+        self._log("开始失能回程，已开启的重力前馈继续工作")
+        self._start_arm_travel(live, "disable")
 
-    def _on_reset(self) -> None:
-        pass
+    def _arms_to_retry(self) -> dict[str, DriverArm]:
+        if (not self._connected or self._is_sim or self._power_motion_pending
+                or self._traveling or self._estopping):
+            return {}
+        live = {side: arm for side, arm in self.arms.items() if arm.connected}
+        waiting = {side: arm for side, arm in live.items() if not arm.enabled}
+        return waiting if len(live) == 2 and len(waiting) == 1 else {}
+
+    def _on_retry_enable(self) -> None:
+        waiting = self._arms_to_retry()
+        if waiting:
+            self._begin_enable(waiting, retry=True)
+
+    def _begin_enable(self, arms: dict[str, DriverArm], *, retry: bool = False) -> None:
+        if self._probing:
+            self._log("请等待总线体检结束后再使能")
+            return
+        self._stop_teleop("使能")
+        self._stop_teach_play("使能")
+        self.sw_ee_drag.setChecked(False)
+        self._clear_motion_targets(hold=True)
+        mode = self._selected_force_mode()
+        was_position = mode == "position"
+        if was_position:
+            mode = "gravity"
+            self._set_force_switches(mode)
+        if retry:
+            # 启动失败会清掉该臂的驱动模式，重试前重新提交当前力控设置。
+            # 若原先是位置保持，双臂都对齐到使能默认的重力补偿。
+            for source in (self.arms if was_position else arms).values():
+                if source.connected:
+                    self._send_force_mode(source, mode)
+        self._enabling = True
+        self._update_power_controls()
+        labels = "、".join("左臂" if side == "left" else "右臂" for side in arms)
+        self._log(f"{labels}开始使能，根据实测姿态建立重力补偿，再走向起始位")
+        self._start_arm_travel(arms, "enable")
+
+    def _update_power_controls(self) -> None:
+        busy = self._power_motion_pending
+        self.btn_enable.setEnabled(not busy and not self._estopping)
+        self.btn_retry_enable.setVisible(bool(self._arms_to_retry()))
+        self.btn_connect.setEnabled(not busy and not self._estopping
+                                    and self._conn_state != "connecting")
+        self.sw_mode.setEnabled(not busy and not self._estopping)
+        self._refresh_teleop_controls()
+        if self._estopping:
+            self.btn_enable.setText("急停中…")
+        elif self._enabling:
+            self.btn_enable.setText("使能走位中…")
+        elif self._disabling:
+            self.btn_enable.setText("失能回程中…")
+        else:
+            self.btn_enable.setText("失能" if any(a.enabled for a in self.arms.values()) else "使能")
+        self._refresh_impedance_status()
 
     # ── 主工作区 ──────────────────────────────────────
     def _build_workspace(self) -> QWidget:
@@ -1005,7 +1051,9 @@ class StudioWindow(QMainWindow):
         lay.addWidget(strip)
 
         # 关节控制（常住）：选臂 + 7 关节滑块 + 全部回零
-        jcard = GroupCard("关节控制", host)
+        lay.addWidget(self._build_teleop_card(host))
+
+        self._joint_controls = jcard = GroupCard("关节控制", host)
         self.combo_arm = QComboBox(jcard)
         self.combo_arm.addItems(["左臂 openarm_left", "右臂 openarm_right"])
         self.combo_arm.currentIndexChanged.connect(self._rebuild_sliders)
@@ -1016,8 +1064,9 @@ class StudioWindow(QMainWindow):
         self._slider_layout.setSpacing(4)
         jcard.add(self._slider_host)
 
-        zrow = QHBoxLayout()
-        zrow.setSpacing(6)
+        pose_row = QHBoxLayout()
+        pose_row.setContentsMargins(0, 0, 0, 0)
+        pose_row.setSpacing(6)
         self.btn_zero = QPushButton("全部回零", jcard)
         self.btn_zero.setObjectName("btnSecondary")
         self.btn_zero.setCursor(Qt.PointingHandCursor)
@@ -1026,21 +1075,11 @@ class StudioWindow(QMainWindow):
         self.btn_goto_start.setObjectName("btnSecondary")
         self.btn_goto_start.setCursor(Qt.PointingHandCursor)
         self.btn_goto_start.clicked.connect(lambda: self._on_move_pose("goto_start"))
-        self.btn_park = QPushButton("收臂", jcard)
-        self.btn_park.setObjectName("btnSecondary")
-        self.btn_park.setCursor(Qt.PointingHandCursor)
-        self.btn_park.clicked.connect(lambda: self._on_move_pose("goto_stop"))
-        self.btn_sync = QPushButton("同步实测", jcard)
-        self.btn_sync.setObjectName("btnSecondary")
-        self.btn_sync.setCursor(Qt.PointingHandCursor)
-        self.btn_sync.setToolTip("把滑块目标对齐到机械臂当前实际位置")
-        self.btn_sync.clicked.connect(self._sync_sliders_to_actual)
-        for b in (self.btn_zero, self.btn_goto_start, self.btn_park, self.btn_sync):
-            zrow.addWidget(b)
-        zrow.addStretch(1)
-        zholder = QWidget(jcard)
-        zholder.setLayout(zrow)
-        jcard.add(zholder)
+        pose_row.addWidget(self.btn_zero, 1)
+        pose_row.addWidget(self.btn_goto_start, 1)
+        pose_actions = QWidget(jcard)
+        pose_actions.setLayout(pose_row)
+        jcard.add(pose_actions)
 
         # 末端拖拽（官方 openarm_control IK，基于官方 v1 MuJoCo 模型）
         self.sw_ee_drag = Switch(self._pal_now, False, jcard)
@@ -1090,14 +1129,16 @@ class StudioWindow(QMainWindow):
         self.lbl_zeta.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         fcard.add(self._param_row(fcard, "阻尼", self.sld_zeta, self.lbl_zeta))
 
-        self.lbl_gain = QLabel("Kp -- · 阻尼比 --", fcard)
+        self.lbl_gain = QLabel("关节阻抗未开启", fcard)
+        self.lbl_gain.setWordWrap(True)
+        self.lbl_gain.setToolTip("J1–J7 最近提交给 CAN 驱动的增益。可在上方切换左右臂。")
         self.lbl_gain.setObjectName("jointHint")
         fcard.add(self.lbl_gain)
         self._on_imp_param()          # 初始把数值标签填上
 
         self.sw_friction = self._switch_row(
-            fcard, "摩擦补偿", "官方 tanh 摩擦模型（库仑 + 粘滞），"
-                              "改善低速拖动的粘滞感")
+            fcard, "摩擦补偿", "根据各关节的实测速度补偿摩擦，"
+                              "静止时抑制噪声，反向时撤掉旧方向的助力")
         self.sw_friction.setChecked(True)
         self.sw_friction.toggled.connect(self._on_friction_toggle)
 
@@ -1107,13 +1148,14 @@ class StudioWindow(QMainWindow):
         lay.addWidget(fcard)
 
         # 夹爪控制（常住）：左右滑块（0–44 mm）
-        gcard = GroupCard("夹爪控制", host)
+        self._gripper_controls = gcard = GroupCard("夹爪控制", host)
         gcard.add(self._build_grip_row(gcard, "left", "左夹爪"))
         gcard.add(GroupRule(gcard))
         gcard.add(self._build_grip_row(gcard, "right", "右夹爪"))
         lay.addWidget(gcard)
 
         self._rebuild_sliders()
+        self._refresh_teleop_controls()
         lay.addStretch(1)
         # 左列内容会随窗口高度变化（1366×768 这类屏放不下全部卡片），
         # 包一层滚动区：宁可滚动，也不要把卡片裁掉半截。
@@ -1130,6 +1172,30 @@ class StudioWindow(QMainWindow):
         scroll.setMinimumWidth(354)
         scroll.setWidget(host)
         return scroll
+
+    def _build_teleop_card(self, parent) -> GroupCard:
+        card = GroupCard("双臂协同", parent)
+        self.combo_teleop = QComboBox(card)
+        self.combo_teleop.addItem("左臂手推 → 右臂跟随", "left")
+        self.combo_teleop.addItem("右臂手推 → 左臂跟随", "right")
+        self.btn_teleop = QPushButton("开始跟随", card)
+        self.btn_teleop.setObjectName("btnSecondary")
+        self.btn_teleop.clicked.connect(self._toggle_teleop)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.combo_teleop, 1)
+        row.addWidget(self.btn_teleop)
+        holder = QWidget(card)
+        holder.setLayout(row)
+        card.add(holder)
+        self.sw_teleop_mirror = self._switch_row(
+            card, "镜像跟随", "开启时左右镜像。关闭时按底座坐标系的零位轴方向映射关节增量。")
+        self.sw_teleop_mirror.setChecked(True)
+        self.lbl_teleop = QLabel(card)
+        self.lbl_teleop.setObjectName("jointHint")
+        self.lbl_teleop.setWordWrap(True)
+        card.add(self.lbl_teleop)
+        return card
 
     def _switch_row(self, card: GroupCard, label: str, tip: str) -> Switch:
         """在分组卡里加一行「标签 + 开关」，返回开关。"""
@@ -1180,7 +1246,7 @@ class StudioWindow(QMainWindow):
         tq.setObjectName("jointTorque")
         tq.setFixedWidth(46)
         tq.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        tq.setToolTip("夹持力矩（Nm）")
+        tq.setToolTip("电机回报力矩（Nm）")
         tq.setProperty("warn", False)
         top.addWidget(lbl)
         top.addStretch(1)
@@ -1195,6 +1261,37 @@ class StudioWindow(QMainWindow):
         rl.addWidget(sld)
         self._sliders[name] = (sld, val)
         self._torque_labels[name] = tq
+
+        controls = QHBoxLayout()
+        limit = QSpinBox(row)
+        limit.setRange(10, 100)
+        limit.setValue(60)
+        limit.setSuffix(" %")
+        limit.setToolTip(
+            "夹持电流上限，100% = 设备配置上限：实测堵转约 2.1 N·m（指尖约 40–50 N），"
+            "60% ≈ 1.3 N·m（约 20–30 N）。机构摩擦实测 0.24–0.53 N·m，低于约 40% 时"
+            "夹爪可能半途卡住；智能抓取最低按 40% 执行。")
+        limit.valueChanged.connect(lambda value, side=side: self._on_gripper_force(side, value))
+        grasp = QPushButton("智能抓取", row)
+        grasp.setObjectName("btnSecondary")
+        grasp.setToolTip(
+            "夹爪以约 21 mm/s 闭合到物体上，夹住后按上方电流上限持续夹持，"
+            "拖开口滑块或点「张开」才松开。夹爪全闭仍未碰到物体时提示未夹到。")
+        grasp.clicked.connect(lambda _checked=False, side=side: self._on_grasp(side))
+        release = QPushButton("张开", row)
+        release.setObjectName("btnSecondary")
+        release.clicked.connect(lambda _checked=False, n=name: self._on_slider(n, int(GRIP_OPEN * 1000)))
+        status = QLabel(row)
+        status.setObjectName("jointHint")
+        status.setWordWrap(True)
+        controls.addWidget(QLabel("电流上限", row))
+        controls.addWidget(limit)
+        controls.addStretch(1)
+        controls.addWidget(grasp)
+        controls.addWidget(release)
+        rl.addLayout(controls)
+        rl.addWidget(status)
+        self._grip_options[side] = limit, grasp, release, status
         return row
 
     def _build_3d_card(self, parent) -> QWidget:
@@ -1356,6 +1453,8 @@ class StudioWindow(QMainWindow):
             top.addWidget(tq)
             sld = QSlider(Qt.Horizontal, row)
             sld.setRange(-314, 314)
+            peak = SLIDER_JOINT_SPEED_LIMITS_RAD_S[i - 1]
+            sld.setToolTip(f"J{i} 真机滑块目标峰值 {peak:.2f} rad/s，受设备配置限速约束")
             sld.valueChanged.connect(lambda v, n=name: self._on_slider(n, v))
             rl.addLayout(top)
             rl.addWidget(sld)
@@ -1370,7 +1469,15 @@ class StudioWindow(QMainWindow):
             self._torque_labels[name] = tq
 
     def _on_slider(self, name: str, raw: int) -> None:
+        if self._teleop_session is not None or self._traveling or self._estopping:
+            return
         is_grip = "finger" in name
+        if not self._is_sim and self.sw_teach.isChecked() and not is_grip:
+            return
+        self._stop_teach_play("手动调节")
+        if not is_grip and self.sw_ee_drag.isChecked():
+            self.sw_ee_drag.setChecked(False)
+            self._clear_motion_targets(hold=True)
         val = raw / 1000.0 if is_grip else raw / 100.0
         pair = self._sliders.get(name)
         if pair:
@@ -1382,9 +1489,14 @@ class StudioWindow(QMainWindow):
         self._local_pose[name] = val
         if self._worker and not self._following_real():
             self._worker.set_pose(self._local_pose)
-        # 真机已连接+使能：目标进指令队列，50Hz 定时器统一下发
-        if self._connected and not self._is_sim:
+        # 关节目标立即交给驱动，实际 CAN 下发仍由控制线程节流。
+        side = name.split("_", 2)[1]
+        arm = self.arms.get(side)
+        if self._connected and not self._is_sim and not self._traveling and arm and arm.enabled:
             self._cmd_pose[name] = val
+            if not is_grip:
+                self._slider_target_sides.add(side)
+            self._send_live_targets(only_side=side)
 
     # ── 末端拖拽（官方 openarm_control IK）─────────────────
     @property
@@ -1413,31 +1525,95 @@ class StudioWindow(QMainWindow):
         return self._ik
 
     def _on_teach_toggle(self, on: bool) -> None:
-        """示教（零重力拖拽）：kp≈0.5 + 重力前馈，手推臂即可移动。
+        self._select_force_mode("teach" if on else "position")
 
-        只管"变软"，不再兼管录制——录制有「示教」页的显式开始/停止按钮。
-        退出零重力时若还在录，顺手停掉并保存，避免录到一半的数据丢掉。
-        """
-        armed = [a for a in self.arms.values() if a.connected]
-        if on and not armed:
-            self._log("示教模式：需要先连接机械臂")
-            self.sw_teach.setChecked(False)
+    def _selected_force_mode(self) -> str:
+        if self.sw_teach.isChecked():
+            return "teach"
+        if self.sw_jimp.isChecked():
+            return "impedance"
+        return "gravity" if self.sw_gravity.isChecked() else "position"
+
+    def _set_force_switches(self, mode: str) -> None:
+        for name, switch in (("gravity", self.sw_gravity), ("teach", self.sw_teach),
+                             ("impedance", self.sw_jimp)):
+            with QSignalBlocker(switch):
+                switch.setChecked(name == mode)
+        self.setProperty("teach", "on" if mode == "teach" else "off")
+
+    def _send_force_mode(self, arm: DriverArm, mode: str) -> None:
+        arm.set_control_mode(mode, stiffness=self._imp_stiffness(), zeta=self._imp_zeta())
+
+    def _select_force_mode(self, mode: str) -> None:
+        if self._traveling or self._teleop_session is not None or self._estopping:
             return
-        if on:
-            if self.sw_gravity.isChecked():
-                self.sw_gravity.setChecked(False)   # 与重力补偿互斥
-            if self.sw_jimp.isChecked():
-                self.sw_jimp.setChecked(False)      # 与关节阻抗互斥
+        connected = [arm for arm in self.arms.values() if arm.connected]
+        if self._is_sim or (mode != "position" and not connected):
+            self._set_force_switches("position")
+            self._log("力控模式需要连接真机")
+            return
+        previously_teaching = self.property("teach") == "on"
+        self._stop_teach_play("切换力控")
+        self._clear_motion_targets(hold=True)
+        if mode in ("teach", "impedance"):
+            self.sw_ee_drag.setChecked(False)
+        if previously_teaching and mode != "teach" and self._recording:
+            self._stop_record()
+        self._set_force_switches(mode)
+        for arm in connected:
+            self._send_force_mode(arm, mode)
+        self._refresh_impedance_status()
+        self._refresh_teleop_controls()
+
+    def _clear_motion_targets(self, *, hold: bool = False) -> None:
+        self._cmd_pose.clear()
+        self._slider_target_sides.clear()
+        self._pending_sliders.clear()
+        if hold and not self._is_sim:
             for arm in self.arms.values():
-                arm.set_gravity_comp(True, scale=1.0, kp_floor=0.5)
-            self._log("示教模式开启：零重力，可以手推机械臂；"
-                      "要记录轨迹请到「示教」页点「开始录制」")
-        else:
-            for arm in self.arms.values():
-                arm.set_gravity_comp(False)
-            if self._recording:
-                self._stop_record()
-        self.setProperty("teach", "on" if on else "off")
+                if arm.connected:
+                    arm.set_targets(None)
+
+    def _on_gripper_force(self, side: str, percent: int) -> None:
+        arm = self.arms.get(side)
+        if arm is not None and arm.connected:
+            arm.set_gripper_force(percent)
+
+    def _on_grasp(self, side: str) -> None:
+        arm = self.arms.get(side)
+        if (self._is_sim or self._traveling or self._estopping or self._teleop_session is not None
+                or arm is None or not arm.connected or not arm.enabled):
+            return
+        self._stop_teach_play("智能抓取")
+        if arm.request_grasp():
+            name = f"openarm_{side}_finger_joint1"
+            self._cmd_pose.pop(name, None)
+            self._pending_sliders.discard(name)
+            self._refresh_teleop_controls()
+
+    def _refresh_gripper_controls(self, available: bool) -> None:
+        self._gripper_controls.setEnabled(available)
+        texts = {
+            "pending": "等待夹爪反馈", "closing": "闭合中 · 夹住后按电流上限保持",
+            "holding": "已夹持 · 保持中", "empty": "未夹到物体 · 夹爪已全闭",
+            "timeout": "未在限时内停住 · 仍在闭合", "lost": "物体已脱出 · 夹爪已全闭",
+            "feedback_lost": "夹爪反馈异常 · 抓取未确认", "cancelled": "抓取已停止",
+        }
+        for side, (limit, grasp, release, status) in self._grip_options.items():
+            arm = self.arms.get(side)
+            supported = arm is not None and getattr(arm, "supports_gripper_control", False)
+            enabled = supported and arm.enabled and not self._is_sim
+            phase = getattr(arm, "grasp_status", "idle")
+            busy = phase in ("pending", "closing", "holding")
+            limit.setEnabled(available and not self._is_sim and not busy)
+            grasp.setEnabled(available and enabled and not busy)
+            release.setEnabled(available and (self._is_sim or enabled))
+            text = texts.get(phase, "")
+            torque_limit = getattr(arm, "grasp_torque_limit", None)
+            if torque_limit is not None and phase not in ("idle", "pending"):
+                text += f"（电流上限 {torque_limit:.2f} N·m）"
+            status.setText(text)
+            status.setVisible(enabled and phase != "idle")
 
     # ── 录制（显式开始/停止）───────────────────────────
     def _on_record_toggle(self) -> None:
@@ -1447,17 +1623,20 @@ class StudioWindow(QMainWindow):
             self._start_record()
 
     def _start_record(self) -> None:
+        if self._is_sim or self._traveling or self._estopping:
+            self._log("录制需要真机，当前走位结束后可开始录制")
+            return
         if self._play_timer.isActive():
             self._stop_teach_play("开始录制")
-        if not any(a.connected for a in self.arms.values()):
-            self._log("录制：需要先连接机械臂（否则录到的是滑块值，不是真机姿态）")
+        if self._read_record_pose() is None:
+            self._log("录制：需要先连接双臂并取得完整的实测反馈")
             return
         self._rec_traj = []
         self._rec_t0 = time.monotonic()
         self._recording = True
         self._style_record_btn(True)
         self._log("录制开始：50Hz 采样双臂关节 + 夹爪"
-                  + ("" if self.sw_teach.isChecked()
+                  + ("" if self.sw_teach.isChecked() or self._teleop_session is not None
                      else "（提示：当前不是零重力，手推不动；可直接用滑块）"))
 
     def _stop_record(self) -> None:
@@ -1473,15 +1652,29 @@ class StudioWindow(QMainWindow):
         self.btn_record.style().polish(self.btn_record)
         self.lbl_rec.setText("● 录制中 …" if recording else "空闲 · 未录制")
 
-    def _record_teach(self, pose: dict) -> None:
+    def _read_record_pose(self) -> dict[str, float] | None:
+        pose = {}
+        for side in ("left", "right"):
+            arm = self.arms.get(side)
+            if arm is None or not arm.connected or arm.joint_feedback(require_enabled=False) is None:
+                return None
+            positions = arm.positions()
+            prefix = f"openarm_{side}_"
+            names = [f"{prefix}joint{i}" for i in range(1, 8)] + [f"{prefix}finger_joint1"]
+            if any(name not in positions or not np.isfinite(positions[name]) for name in names):
+                return None
+            pose.update({name: positions[name] for name in names})
+        return pose
+
+    def _record_teach(self, pose: dict[str, float]) -> None:
         """50Hz 记录当前关节角（录制中由 _push_pose 调用）。
 
         列：t + 左右各 7 个关节角 + 左右夹爪开口（米）。
         早期 CSV 只有前 15 列，回放时会自动兼容（没有夹爪就只放关节）。
         """
-        row = [round(pose.get(f"openarm_{s}_joint{i}", 0.0), 4)
+        row = [round(pose[f"openarm_{s}_joint{i}"], 4)
                for s in ("left", "right") for i in range(1, 8)]
-        grip = [round(pose.get(f"openarm_{s}_finger_joint1", 0.0), 5)
+        grip = [round(pose[f"openarm_{s}_finger_joint1"], 5)
                 for s in ("left", "right")]
         self._rec_traj.append([round(time.monotonic() - self._rec_t0, 4),
                                *row, *grip])
@@ -1543,52 +1736,83 @@ class StudioWindow(QMainWindow):
             rd = csv.reader(f)
             next(rd, None)                        # 表头
             for row in rd:
-                if len(row) < 15:
+                if len(row) not in (15, 17):
                     continue
                 try:
-                    rows.append([float(v) for v in row[:17]])
+                    values = [float(v) for v in row]
+                    if np.isfinite(values).all() and (not rows or values[0] > rows[-1][0]):
+                        rows.append(values)
                 except ValueError:
                     continue
         return rows
 
     def _on_teach_play(self) -> None:
+        if self._traveling or self._estopping or self._teleop_session is not None:
+            return
         if self._play_timer.isActive():
             self._stop_teach_play("手动停止")
             return
         name = self.combo_teach.currentText()
         if not name:
             return
-        rows = self._load_teach_csv(self._teach_dir() / name)
+        try:
+            rows = self._load_teach_csv(self._teach_dir() / name)
+        except (OSError, UnicodeError) as exc:
+            self._log(f"回放：无法读取 {name}（{exc}）")
+            return
         if len(rows) < 2:
             self._log(f"回放：{name} 没有足够的有效帧")
             return
-        # 零重力会软化位置环，回放要的是准位姿跟踪，先关掉
-        if self.sw_teach.isChecked():
-            self.sw_teach.setChecked(False)
-        enabled = any(a.enabled for a in self.arms.values())
-        if not enabled:
-            # 未使能也能播：只推 3D 孪生，用来对轨迹
-            self._log("回放：机械臂未使能，仅 3D 预览（使能后才会驱动真机）")
+        live = {side for side, arm in self.arms.items() if arm.connected and arm.enabled}
+        if self._is_sim:
+            live.clear()
+        if live and not all(self.arms[side].joint_feedback() is not None for side in live):
+            self._log("回放：参与机械臂缺少实时关节反馈")
+            return
+        if live and self.sw_teach.isChecked():
+            self._select_force_mode("gravity")
+        if self._recording:
+            self._stop_record()
+        self._clear_motion_targets(hold=bool(live))
+        self.sw_ee_drag.setChecked(False)
+        self._play_live_sides = live
+        if not live:
+            self._log("回放：仅预览 3D 姿态")
         self._play_rows = rows
         self._play_i = 0
-        self._play_t0 = time.monotonic()
-        self._play_dur = max(rows[-1][0], 0.1)
+        self._play_t0 = self._play_last_tick = time.monotonic()
+        self._play_dur = max(rows[-1][0] - rows[0][0], 0.1)
         self._play_timer.start()
         self.btn_teach_play.setText("停止")
         self._log(f"回放开始：{name}（{len(rows)} 帧 / {self._play_dur:.1f}s）")
         self._play_tick()
 
+    def _playback_feedback_ok(self) -> bool:
+        return all(
+            (arm := self.arms.get(side)) is not None and arm.connected and arm.enabled
+            and arm.joint_feedback() is not None for side in self._play_live_sides
+        )
+
     def _play_tick(self) -> None:
+        now = time.monotonic()
+        if self._play_live_sides and now - self._play_last_tick > 0.15:
+            self._stop_teach_play("回放更新中断")
+            return
+        self._play_last_tick = now
+        if not self._playback_feedback_ok():
+            self._stop_teach_play("参与回放的机械臂失去反馈或失能")
+            return
         rows = self._play_rows
         if len(rows) < 2:
             self._stop_teach_play("无数据")
             return
-        t = time.monotonic() - self._play_t0 + rows[0][0]
+        t = now - self._play_t0 + rows[0][0]
         while self._play_i + 1 < len(rows) and rows[self._play_i + 1][0] <= t:
             self._play_i += 1
         if self._play_i + 1 >= len(rows):
             self._apply_teach_frame(rows[-1])
-            self._stop_teach_play("播放完成")
+            self._send_live_targets(final_frame=True)
+            self._stop_teach_play("播放完成", hold=False)
             return
         a, b = rows[self._play_i], rows[self._play_i + 1]
         span = max(b[0] - a[0], 1e-6)
@@ -1610,42 +1834,28 @@ class StudioWindow(QMainWindow):
             for i, side in enumerate(("left", "right")):
                 vals[f"openarm_{side}_finger_joint1"] = float(frame[15 + i])
         self._local_pose.update(vals)
-        if any(a.enabled for a in self.arms.values()):
-            self._cmd_pose.update(vals)
+        if self._play_live_sides:
+            self._cmd_pose = {name: value for name, value in vals.items()
+                              if name.split("_", 2)[1] in self._play_live_sides}
         elif self._worker is not None:
             self._worker.set_pose(self._local_pose)
 
-    def _stop_teach_play(self, why: str) -> None:
+    def _stop_teach_play(self, why: str, *, hold: bool = True) -> None:
         was = self._play_timer.isActive()
+        if not was and not self._play_rows:
+            return
+        live = bool(self._play_live_sides)
         self._play_timer.stop()
         self._play_rows = []
+        self._play_live_sides.clear()
         self.btn_teach_play.setText("播放")
         self.lbl_teach.setText("回放 --")
         if was:
+            self._clear_motion_targets(hold=hold and live)
             self._log(f"回放结束：{why}")
 
     def _on_gravity_toggle(self, on: bool) -> None:
-        """开关重力补偿。
-
-        只要求「已连接」：使能是异步的（start 轨迹约 2s），使能后自动
-        开补偿时会走这里，此时 enabled 还没翻转——驱动端会把重力帧
-        挂起直到使能完成，所以这里放行即可。
-        与示教互斥：开补偿时自动关示教。
-        """
-        connected = [a for a in self.arms.values() if a.connected]
-        if on and not connected:
-            self._log("重力补偿：需要先连接机械臂")
-            self.sw_gravity.setChecked(False)
-            return
-        if on and self.sw_teach.isChecked():
-            self.sw_teach.setChecked(False)     # 触发 _on_teach_toggle(False)
-        if on and self.sw_jimp.isChecked():
-            self.sw_jimp.setChecked(False)      # 同一软模式帧，二选一
-        for arm in self.arms.values():
-            # kp 用官方值 70：重力前馈只做减载，位置环仍保持原有刚性。
-            # 低 kp（如 30）在拖滑块时阻尼比不足 0.6，会持续小幅振荡。
-            arm.set_gravity_comp(on, scale=1.0, kp_floor=70.0)
-        self._log("重力补偿：" + ("开启（前馈 ×1.0，位置环 kp=70 减载）" if on else "关闭"))
+        self._select_force_mode("gravity" if on else "position")
 
     # ── 关节阻抗参数 ──────────────────────────────────
     def _imp_stiffness(self) -> float:
@@ -1655,59 +1865,66 @@ class StudioWindow(QMainWindow):
         return self.sld_zeta.value() / 100.0
 
     def _on_jimp_toggle(self, on: bool) -> None:
-        """整臂关节空间阻抗：7 个关节同时按刚度/阻尼比给 PD，前馈仍为 G+fric。
-
-        与重力补偿/示教互斥——它们共用同一个软模式帧，叠在一起就是两套
-        增益抢同一条臂。
-        """
-        connected = [a for a in self.arms.values() if a.connected]
-        if on and not connected:
-            self._log("关节阻抗：需要先连接机械臂")
-            self.sw_jimp.setChecked(False)
-            return
-        if on:
-            if self.sw_gravity.isChecked():
-                self.sw_gravity.setChecked(False)
-            if self.sw_teach.isChecked():
-                self.sw_teach.setChecked(False)
-            if self.sw_ee_drag.isChecked():
-                self.sw_ee_drag.setChecked(False)
-        s, z = self._imp_stiffness(), self._imp_zeta()
-        for arm in self.arms.values():
-            if arm.connected:
-                arm.set_joint_impedance(on, stiffness=s, zeta=z)
-        self.sld_stiff.setEnabled(not on)
-        self.sld_zeta.setEnabled(not on)
-        self._log("关节阻抗：" + (
-            f"开启（刚度 {s:.0%}，阻尼比 {z:.2f}）" if on else "关闭（已恢复位置保持）"))
+        self._select_force_mode("impedance" if on else "position")
 
     def _on_imp_param(self) -> None:
         """刚度/阻尼比滑块变化：立即生效（增益按速率平滑过渡）。"""
         s, z = self._imp_stiffness(), self._imp_zeta()
         self.lbl_stiff.setText(f"{s:.0%}")
         self.lbl_zeta.setText(f"{z:.2f}")
-        base_kp = (70.0, 70.0, 70.0, 60.0, 10.0, 10.0, 10.0)
-        kp = [max(0.5, b * s) for b in base_kp]
-        self.lbl_gain.setText(
-            f"Kp {kp[0]:.1f}/{kp[1]:.1f}/{kp[2]:.1f}/{kp[3]:.1f}/"
-            f"{kp[4]:.1f}/{kp[5]:.1f}/{kp[6]:.1f} · ζ {z:.2f}")
-        if not self.sw_jimp.isChecked():
+        if (self._is_sim or self._traveling or self._teleop_session is not None
+                or not self.sw_jimp.isChecked()):
             return
         for arm in self.arms.values():
             if arm.connected:
-                arm.set_joint_impedance(True, stiffness=s, zeta=z)
+                self._send_force_mode(arm, "impedance")
+
+    def _refresh_impedance_status(self) -> None:
+        sim = self._is_sim
+        on = self.sw_jimp.isChecked()
+        editable = not sim and not self._traveling and not self._estopping and self._teleop_session is None
+        self.sw_jimp.setEnabled(editable)
+        self.sld_stiff.setEnabled(on and editable)
+        self.sld_zeta.setEnabled(on and editable)
+        if sim:
+            text = "仿真使用固定伺服增益"
+        elif self._teleop_session is not None:
+            text = "协同模式使用重力前馈"
+        elif not on:
+            text = "关节阻抗未开启"
+        else:
+            side = self._active_side
+            name = "左臂" if side == "left" else "右臂"
+            arm = self.arms.get(side)
+            if arm is None or not arm.connected:
+                text = f"{name}未连接"
+            elif not arm.enabled:
+                text = f"{name}待使能"
+            elif (gains := arm.impedance_gains) is None:
+                text = f"{name}尚无近期阻抗帧"
+            else:
+                kp, kd = gains
+                kp_values = " / ".join(f"{v:.1f}" for v in kp)
+                kd_values = " / ".join(f"{v:.2f}" for v in kd)
+                text = f"{name} Kp {kp_values}\nKd {kd_values}"
+        self.lbl_gain.setText(text)
 
     def _on_friction_toggle(self, on: bool) -> None:
-        """摩擦补偿：官方 tanh 模型，叠加在重力帧/导纳帧的前馈里。"""
+        """设置重力补偿、零重力示教和关节阻抗中的摩擦助力。"""
         for arm in self.arms.values():
             if arm.connected:
                 arm.set_friction_comp(on)
-        self._log("摩擦补偿：" + ("开启（库仑 + 粘滞，官方标定参数）"
-                                 if on else "关闭"))
+        self._log("摩擦补偿已开启" if on else "摩擦补偿已关闭")
 
     def _on_ee_drag_toggle(self, on: bool) -> None:
+        if on and (self._traveling or self._estopping or self._teleop_session is not None
+                   or (not self._is_sim and (self.sw_teach.isChecked() or self.sw_jimp.isChecked()))):
+            self.sw_ee_drag.setChecked(False)
+            return
         self._ee_drag_on = bool(on)
         if on:
+            self._stop_teach_play("开始末端拖拽")
+            self._clear_motion_targets(hold=True)
             ik = self._ensure_ik()
             if ik is None:
                 self.sw_ee_drag.setChecked(False)
@@ -1734,9 +1951,14 @@ class StudioWindow(QMainWindow):
         self.view.set_ee_pose(tuple(pose[:3]), tuple(pose[3:]))
 
     def _on_ee_drag(self, world, done: bool) -> None:
-        """3D 拖拽回调：拖动中实时跟随（单步迭代），松手后精确收敛。"""
-        if not getattr(self, "_ee_drag_on", False):
+        """拖动中实时跟随，松手后精确收敛。"""
+        if self._traveling or self._teleop_session is not None or self._estopping:
             return
+        if not self._is_sim and (self.sw_teach.isChecked() or self.sw_jimp.isChecked()):
+            return
+        if not self._ee_drag_on:
+            return
+        self._stop_teach_play("末端拖拽")
         ik = getattr(self, "_ik", None)
         if ik is None:
             return
@@ -1764,7 +1986,7 @@ class StudioWindow(QMainWindow):
         for i in range(1, 8):
             name = f"openarm_{side}_joint{i}"
             self._local_pose[name] = float(sol[i - 1])
-            if self._connected and not self._is_sim:
+            if self._connected and not self._is_sim and not self._traveling:
                 self._cmd_pose[name] = float(sol[i - 1])
         if self._worker and not self._following_real():
             self._worker.set_pose(self._local_pose)
@@ -1773,28 +1995,54 @@ class StudioWindow(QMainWindow):
         self._update_ee_marker()
 
     def _on_move_pose(self, kind: str) -> None:
-        """平滑运动到配置位姿：goto_start 起始位 / goto_stop 收臂位。"""
-        live = [a for a in self.arms.values() if a.connected]
-        if not live:
-            self._log("平滑运动：臂未连接")
+        """按手动限速移动到配置位姿，保留当前的补偿和阻抗设置。"""
+        if self._traveling or self._is_sim or self._estopping or self._teleop_session is not None:
             return
-        # 轨迹期间暂停 50Hz 目标下发：否则旧滑块目标会在队列里积压，
-        # 轨迹结束瞬间回放 → 跳变超限 → 官方安全链锁存 → 自动失能（下垂）。
-        self._traveling = True
-        for arm in self.arms.values():
-            if kind == "goto_start":
-                arm.move_start()
-            else:
-                arm.move_park()
-        self._log(f"平滑运动指令已下发（{len(live)} 臂，"
-                  f"{'起始位' if kind == 'goto_start' else '收臂位'}，臂会动；"
-                  "期间滑块下发暂停）")
-        QTimer.singleShot(4500, self._after_travel)
+        live = {side: arm for side, arm in self.arms.items()
+                if arm.connected and arm.enabled}
+        if not live:
+            self._log("平滑运动：臂未连接或未使能")
+            return
+        if self.sw_teach.isChecked():
+            self._log("平滑运动：请先结束手动示教")
+            return
+        self._stop_teach_play("平滑运动")
+        self.sw_ee_drag.setChecked(False)
+        self._clear_motion_targets(hold=True)
+        self._log(f"平滑运动：{'起始位' if kind == 'goto_start' else '收臂位'}，"
+                  f"限制关节目标速度为 {MANUAL_JOINT_SPEED_RAD_S:.2f} rad/s")
+        self._start_arm_travel(live, "move_start" if kind == "goto_start" else "move_park")
 
-    def _after_travel(self) -> None:
-        """轨迹结束：目标基准同步到实测姿态，再恢复滑块下发。"""
+    def _start_arm_travel(self, arms: dict[str, DriverArm], command: str) -> None:
+        self._traveling = True
+        self._travel_id += 1
+        travel_id = self._travel_id
+        self._travel_arms = set(arms)
+        self._travel_ok = True
+        self._refresh_teleop_controls()
+        for side, arm in arms.items():
+            move = getattr(arm, command)
+            if not move(done=lambda ok, side=side: self.travel_sig.emit(travel_id, side, ok)):
+                self._on_arm_travel_done(travel_id, side, False)
+
+    def _on_arm_travel_done(self, travel_id: int, side: str, ok: bool) -> None:
+        if travel_id != self._travel_id or side not in self._travel_arms:
+            return
+        self._travel_arms.remove(side)
+        self._travel_ok = self._travel_ok and ok
+        if self._enabling and not ok:
+            label = "左臂" if side == "left" else "右臂"
+            arm = self.arms.get(side)
+            status = "保持使能，起始位未确认" if arm is not None and arm.enabled else "未使能"
+            self._log(f"{label}{status}，请查看该臂日志")
+        if not self._travel_arms:
+            self._after_travel(self._travel_ok)
+
+    def _after_travel(self, ok: bool = True) -> None:
+        if not self._traveling:
+            return
+        self._travel_arms.clear()
         pose = self._effective_pose()
-        self._cmd_pose = dict(pose)
         for name, (sld, val) in self._sliders.items():
             cur = pose.get(name)
             if cur is None:
@@ -1808,10 +2056,43 @@ class StudioWindow(QMainWindow):
                 val.setText(f"{cur:+.3f}")
             sld.blockSignals(False)
         self._traveling = False
-        self._log("轨迹结束：目标与滑块已同步到当前姿态")
+        if self._power_motion_pending:
+            enabling = self._enabling
+            self._enabling = self._disabling = False
+            self._clear_motion_targets()
+            if not any(arm.enabled for arm in self.arms.values()):
+                for switch in (self.sw_gravity, self.sw_teach, self.sw_jimp):
+                    with QSignalBlocker(switch):
+                        switch.setChecked(False)
+                self.setProperty("teach", "off")
+            self._update_power_controls()
+            if enabling:
+                if ok:
+                    self._log("使能走位完成，重力前馈继续工作")
+                elif self._arms_to_retry():
+                    self._log("仅一臂已使能，可点击「重试未使能臂」")
+                else:
+                    self._log("使能走位未完成，请查看各臂状态")
+            else:
+                self._log("失能回程完成" if ok else "失能回程中止，请查看各臂状态")
+            action, self._after_disable = self._after_disable, None
+            if action and ok and not self._has_enabled_arms():
+                QTimer.singleShot(0, self.close if action == "close" else self._disconnect)
+        else:
+            self._log(f"轨迹{'完成' if ok else '中止'}：滑块已同步到当前姿态")
+        self._refresh_teleop_controls()
+        self._refresh_impedance_status()
 
     def _zero_pose(self) -> None:
         """全部回零：滑块/孪生清零；真机在已使能的臂上同步下发零目标。"""
+        if self._traveling or self._estopping or self._teleop_session is not None:
+            return
+        if not self._is_sim and self.sw_teach.isChecked():
+            self._log("全部回零：请先结束手动示教")
+            return
+        self._stop_teach_play("全部回零")
+        self.sw_ee_drag.setChecked(False)
+        self._clear_motion_targets(hold=True)
         for name, (sld, val) in self._sliders.items():
             sld.blockSignals(True)
             sld.setValue(0)
@@ -1882,16 +2163,20 @@ class StudioWindow(QMainWindow):
             silent = sum(1 for s in statuses if s == "SILENT")
             faults = sum(v for v in bus.values()
                          if isinstance(v, (int, float)) and not isinstance(v, bool))
-            if silent == 0 and faults == 0:
+            carrier = bus.get("carrier", True)
+            queue_full = bus.get("write_no_buffer", 0)
+            if silent == 0 and faults == 0 and carrier:
                 health_row.set_value("正常")
                 health_row.val.setStyleSheet("")
             else:
                 bits = []
                 if silent:
                     bits.append(f"{silent} 轴静默")
-                if faults:
-                    bits.append(f"总线 {faults}")
-                if not bus.get("carrier", True):
+                if queue_full:
+                    bits.append(f"发送队列满 {queue_full} 次")
+                if faults > queue_full:
+                    bits.append(f"总线 {faults - queue_full}")
+                if not carrier:
                     bits.append("载波丢失")
                 health_row.set_value("·".join(bits))
                 health_row.val.setStyleSheet("color: #e07b00;")
@@ -1913,14 +2198,28 @@ class StudioWindow(QMainWindow):
 
     def _on_mode_change(self, idx: int) -> None:
         sim = idx == 1
+        if self.arms or self._conn_state == "connecting" or self._can_resetting:
+            with QSignalBlocker(self.sw_mode):
+                self.sw_mode.setCurrentIndex(1 - idx)
+            self._log("请先断开真机或等待连接操作结束，再切换模式")
+            return
+        self._stop_teach_play("切换模式")
+        self._clear_motion_targets()
+        self._set_force_switches("position")
+        self._set_conn_state("disconnected", "未连接")
+        if sim:
+            self._stop_teleop("切换仿真")
         if self._worker is not None:
             self._worker.set_mode("sim" if sim else "twin")
             if sim:
                 # 切到仿真时把目标对齐到当前姿态，避免一进去就甩过去
-                self._worker.set_pose(self._worker.positions())
+                self._local_pose.update(self._worker.positions())
+                self._worker.set_pose(self._local_pose)
         self.chip_scene.setText("物理仿真" if sim else "数字孪生")
         self.badge_mode.setText("仿真" if sim else "数字孪生")
         self.btn_enable.setVisible(not sim and self._connected)
+        self._refresh_impedance_status()
+        self._refresh_teleop_controls()
         self._log(f"模式：{'物理仿真（MuJoCo 重力和位置伺服在工作）' if sim else '数字孪生（跟随真机反馈）'}")
         self._goto_page(self.pages.currentIndex())
 
@@ -1931,19 +2230,25 @@ class StudioWindow(QMainWindow):
             self.view.start_intro()
 
     def _on_precheck(self) -> None:
-        pose = self._joint_provider()
-        worst = max((abs(v) for k, v in pose.items() if "finger" not in k), default=0.0)
-        if worst > 0.1:
-            self._log(f"启动前检查：最大关节偏差 {worst:.3f} rad —— 超过 0.1，"
-                      "启动会把关节驱动到零位，请先手动摆正")
+        if self._is_sim or not self.arms:
+            self._log("启动前检查：请先连接真机")
+            return
+        samples = [arm.joint_feedback(require_enabled=False) for arm in self.arms.values()]
+        if any(sample is None for sample in samples):
+            self._log("启动前检查：尚无完整的关节反馈")
+        elif all(sample.stationary() for sample in samples):
+            self._log("启动前检查：机械臂反馈完整且静止")
         else:
-            self._log(f"启动前检查：最大关节偏差 {worst:.3f} rad —— 可以启动")
+            self._log("启动前检查：机械臂仍在运动")
 
     # ── 总线体检（只读探测，后台线程跑，不卡 GUI）──────
     _BUS_LABELS = (("can0", "右臂", "row_bus_r"), ("can1", "左臂", "row_bus_l"))
 
     def _on_bus_check(self) -> None:
-        if self._probing:
+        if self._has_enabled_arms() or self._traveling or self._estopping:
+            self._log("总线体检请在失能后执行，运行时可查看「机器人」页")
+            return
+        if self._probing or self._conn_state == "connecting":
             return
         self._probing = True
         self.btn_bus_check.setEnabled(False)
@@ -1967,9 +2272,18 @@ class StudioWindow(QMainWindow):
 
     def _on_can_reset(self) -> None:
         """CAN 重连：断开 → 重置接口（等效拔插一次 USB）→ 重新连接双臂。"""
-        if getattr(self, "_can_resetting", False):
+        if self._power_motion_pending:
+            return
+        if self._can_resetting or self._conn_state == "connecting" or self._estopping or self._probing:
+            return
+        if self._is_sim or self._has_enabled_arms():
+            self._log("CAN 重连前请切到真机模式并先失能")
+            return
+        self._disconnect()
+        if self.arms:
             return
         self._can_resetting = True
+        self._set_conn_state("connecting", "CAN 重连中…")
         self.btn_can_reset.setEnabled(False)
         self.btn_can_reset.setText("重置中…")
         threading.Thread(target=self._can_reset_worker, daemon=True,
@@ -1978,18 +2292,10 @@ class StudioWindow(QMainWindow):
     def _can_reset_worker(self) -> None:
         import subprocess
 
-        self._log("CAN 重连：断开双臂…")
-        for arm in list(self.arms.values()):
-            try:
-                arm.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
-        self.arms.clear()
-
         script = self.CAN_RESET_SCRIPT
         if not Path(script).exists():
             self._log(f"CAN 重连：缺少脚本 {script}")
-            self._can_reset_done(False)
+            self.reset_sig.emit(False)
             return
         # argv 全部是常量（脚本路径固定、接口名在脚本内），不做任何拼接；
         # sudo -n（免密）优先，退回到 pkexec（图形授权框）
@@ -2013,10 +2319,11 @@ class StudioWindow(QMainWindow):
         for iface in ("can0", "can1"):
             st = can_ifstate(iface)
             self._log(f"CAN 重连：{iface} UP={st['up']} FD={st['fd']}")
-        self._can_reset_done(rc == 0)
+        self.reset_sig.emit(rc == 0)
 
     def _can_reset_done(self, ok: bool) -> None:
         self._can_resetting = False
+        self._set_conn_state("disconnected", "未连接")
         self.btn_can_reset.setEnabled(True)
         self.btn_can_reset.setText("CAN 重连")
         if ok:
@@ -2038,14 +2345,20 @@ class StudioWindow(QMainWindow):
                 self._log(f"总线体检 {label}({iface})：接口打不开 —— {r['error']}")
                 continue
             alive = r.get("alive", 0)
+            queue_full = r.get("tx_queue_full", 0)
+            if queue_full:
+                row.set_value(f"发送队列满 · {alive}/7 回包")
+                self._log(f"总线体检 {label}({iface})：发送队列满 {queue_full} 次，"
+                          f"{alive}/7 轴有状态回包")
+                continue
             if alive == 7:
                 row.set_value(f"在线 {alive}/7")
                 self._log(f"总线体检 {label}({iface})：✅ 7/7 轴在线，"
                           f"位置 {r['positions']}")
             elif alive == 0:
                 row.set_value("❌ 0/7 无应答")
-                self._log(f"总线体检 {label}({iface})：❌ 0/7 应答 —— 总线上没有设备，"
-                          "查该臂供电 → 急停 → CAN 线两端；对调左右线可定位")
+                self._log(f"总线体检 {label}({iface})：0/7 轴有状态回包，"
+                          "请检查该臂供电、急停、CAN 线和电机 ID")
             else:
                 row.set_value(f"⚠️ {alive}/7 部分在线")
                 dead = [f"J{i+1}" for i, (resp, _) in enumerate(r["axes"])
@@ -2053,20 +2366,133 @@ class StudioWindow(QMainWindow):
                 self._log(f"总线体检 {label}({iface})：⚠️ {alive}/7 在线，"
                           f"失联轴 {dead}")
 
-    def _publish_sim_state(self) -> None:
-        """50Hz：真机模式下把滑块目标经 SDK 直发（MIT 帧）。
-
-        重力补偿中的臂也照常收目标——驱动端会把目标写进"锁存姿态"
-        （作为重力帧的位置保持点），不会与重力帧冲突。
-        导纳中的臂也照常投递：驱动端只取夹爪那一维，7 个关节仍归导纳环，
-        否则导纳期间夹爪滑块会完全没反应。
-        """
-        if self._is_sim or not self._cmd_pose or getattr(self, "_traveling", False):
-            return
+    def _read_teleop_feedback(self) -> tuple[dict[str, JointFeedback], str | None]:
+        if not self._connected or self._is_sim:
+            return {}, "需要连接真机双臂"
+        if self._estopping:
+            return {}, "急停"
+        if self._traveling:
+            return {}, "其他走位正在执行"
+        samples = {}
         for side in ("left", "right"):
             arm = self.arms.get(side)
-            if arm is not None and arm.connected and arm.enabled:
-                arm.set_targets(self._cmd_pose)
+            label = "左臂" if side == "left" else "右臂"
+            if arm is None or not arm.connected:
+                return {}, f"{label}已断开"
+            if arm.safety_stop_reason:
+                return {}, f"{label}安全停止（{arm.safety_stop_reason}）"
+            if not arm.enabled:
+                return {}, f"{label}未使能"
+            sample = arm.joint_feedback()
+            if sample is None:
+                return {}, f"{label}关节反馈超时或不完整"
+            samples[side] = sample
+        return samples, None
+
+    def _toggle_teleop(self) -> None:
+        if self._teleop_session is not None:
+            self._stop_teleop("手动停止")
+            return
+        samples, reason = self._read_teleop_feedback()
+        if reason:
+            self._log(f"双臂协同：{reason}")
+            return
+        if not all(sample.stationary() for sample in samples.values()):
+            self._log("双臂协同：等待两臂静止")
+            return
+        self._stop_teach_play("开始双臂协同")
+        self._clear_motion_targets(hold=True)
+        self.sw_ee_drag.setChecked(False)
+        self._set_force_switches("position")
+        side = self.combo_teleop.currentData()
+        other = "right" if side == "left" else "left"
+        session = BimanualTeleop(
+            side, samples[side].positions, samples[other].positions,
+            mirror=self.sw_teleop_mirror.isChecked(),
+        )
+        self._teleop_stop_reason = None
+        self._teleop_session = session
+        self._send_teleop_commands(session, samples)
+        self._refresh_teleop_controls()
+        self._refresh_impedance_status()
+        self._log(f"双臂协同开启，{self.combo_teleop.currentText()}")
+
+    def _send_teleop_commands(self, session: BimanualTeleop, samples: dict[str, JointFeedback]) -> None:
+        leader, follower = session.leader_side, session.follower_side
+        leader_cmd, follower_cmd = session.commands(samples[leader], samples[follower])
+        self.arms[leader].set_teleop(leader_cmd)
+        self.arms[follower].set_teleop(follower_cmd)
+
+    def _stop_teleop(self, reason: str) -> None:
+        session = self._teleop_session
+        if session is None:
+            return
+        session.watchdog.stop(reason)
+        self._teleop_session = None
+        self._teleop_stop_reason = reason
+        self._clear_motion_targets()
+        for arm in self.arms.values():
+            arm.set_teleop(None)
+        if reason != "急停":
+            self._set_force_switches("gravity")
+        self._refresh_teleop_controls()
+        self._refresh_impedance_status()
+        self._log(f"双臂协同停止，{reason}")
+
+    def _refresh_teleop_controls(self) -> None:
+        session = self._teleop_session
+        active = session is not None
+        available = not active and not self._traveling and not self._estopping
+        teaching = not self._is_sim and self.sw_teach.isChecked()
+        self._joint_controls.setEnabled(available)
+        for control in (self._slider_host, self.btn_zero, self.btn_goto_start):
+            control.setEnabled(not teaching)
+        self.sw_ee_drag.setEnabled(not teaching and not self.sw_jimp.isChecked())
+        self._refresh_gripper_controls(available)
+        for switch in (self.sw_gravity, self.sw_teach, self.sw_friction):
+            switch.setEnabled(not active and not self._traveling and not self._estopping
+                              and not self._is_sim)
+        self.combo_teleop.setEnabled(not active and not self._traveling)
+        self.sw_teleop_mirror.setEnabled(not active and not self._traveling and not self._is_sim)
+        self.btn_teleop.setText("停止跟随" if active else "开始跟随")
+        self.btn_teleop.setEnabled(active or (not self._is_sim and available))
+        if session is not None:
+            mapping = "镜像" if session.mirror else "同向"
+            text = f"{mapping}跟随中 · 停止后两臂保持姿态"
+        elif self._is_sim:
+            text = "需要真机的关节反馈"
+        elif self._traveling:
+            text = "等待当前轨迹结束"
+        elif self._teleop_stop_reason:
+            text = f"已停止 · {self._teleop_stop_reason}"
+        else:
+            text = ""
+        self.lbl_teleop.setText(text)
+        self.lbl_teleop.setVisible(bool(text))
+
+    def _send_live_targets(self, *, final_frame: bool = False, only_side: str | None = None) -> None:
+        session = self._teleop_session
+        if session is not None:
+            samples, reason = self._read_teleop_feedback()
+            reason = reason or session.watchdog.reason
+            if reason:
+                self._stop_teleop(reason)
+            else:
+                self._send_teleop_commands(session, samples)
+            return
+        if self._is_sim or not self._cmd_pose or self._traveling or self._estopping:
+            return
+        if self._play_timer.isActive() and not self._playback_feedback_ok():
+            self._stop_teach_play("参与回放的机械臂失去反馈或失能")
+            return
+        manual = final_frame or not self._play_timer.isActive()
+        for side, arm in self.arms.items():
+            if (only_side is None or side == only_side) and arm.connected and arm.enabled:
+                targets = {name: value for name, value in self._cmd_pose.items()
+                           if name.startswith(f"openarm_{side}_")}
+                if targets:
+                    arm.set_targets(targets, manual=manual,
+                                    slider=manual and not final_frame and side in self._slider_target_sides)
 
     def _push_pose(self) -> None:
         """50Hz：把当前姿态推给 3D 渲染线程。
@@ -2079,8 +2505,7 @@ class StudioWindow(QMainWindow):
             return
         pose: dict[str, float] = {}
         # 回放中且没有臂使能：只看录制轨迹（否则会被实测姿态覆盖掉）
-        if self._play_timer.isActive() and not any(
-                a.enabled for a in self.arms.values()):
+        if self._is_sim or (self._play_timer.isActive() and not self._play_live_sides):
             pose = dict(self._local_pose)
         else:
             for a in self.arms.values():
@@ -2090,11 +2515,17 @@ class StudioWindow(QMainWindow):
             if not pose:
                 pose = dict(self._local_pose)
         self._worker.set_pose(pose)
-        # 录制：50Hz 采样实测姿态（不是滑块目标），必须是真机在线的状态
-        if self._recording and self._following_real():
-            self._record_teach(self._effective_pose())
+        if self._recording:
+            recorded_pose = self._read_record_pose()
+            if recorded_pose is None:
+                self._log("录制停止：双臂反馈不完整")
+                self._stop_record()
+            else:
+                self._record_teach(recorded_pose)
 
     def _refresh_status(self) -> None:
+        if self._estopping and not self._has_enabled_arms():
+            self._estopping = False
         pose = self._effective_pose()
         following = self._following_real()
         sim = self._is_sim
@@ -2135,14 +2566,19 @@ class StudioWindow(QMainWindow):
         live = sum(1 for a in self.arms.values() if a.connected)
         self.row_ctrl.set_value(f"{live}/2 臂在线")
         self.row_mode.set_value("仿真" if sim else "真机")
-        self.sum_rows["状态"].setText(
-            "仿真" if sim else ("跟随真机" if following else "本地姿态"))
+        status = "仿真" if sim else ("跟随真机" if following else "本地姿态")
+        if self._enabling:
+            status = "使能走位中"
+        elif self._disabling:
+            status = "失能回程中"
+        self.sum_rows["状态"].setText(status)
         self.sum_rows["模式"].setText("仿真" if sim else "真机")
         self.sum_rows["延迟"].setText(
             f"{rate:.0f}Hz" if following else "—")
         self.sum_rows["上次"].setText(f"{self.view.frame_count}帧")
         self._update_slider_labels(pose)
         self._update_torque_labels()
+        self._update_power_controls()
 
     # 各轴额定力矩（DM8009 54 / DM4340 28 / DM4310 10 Nm），
     # 用来把读数归一化，判断这一轴是不是已经接近能力边界。
@@ -2203,24 +2639,6 @@ class StudioWindow(QMainWindow):
             else:
                 val.setText(f"{cur:+.3f}")
 
-    def _sync_sliders_to_actual(self) -> None:
-        """把滑块（目标）对齐到当前实测位置——用户主动触发，非自动。"""
-        # 用最近一次状态刷新拿到的实测姿态（未连接时它就是滑块自身，无副作用）
-        pose = getattr(self, "_last_pose", None) or self._effective_pose()
-        n = 0
-        for name, (sld, val) in self._sliders.items():
-            cur = pose.get(name)
-            if cur is None:
-                continue
-            sld.blockSignals(True)
-            if "finger" in name:
-                sld.setValue(int(max(0, min(44, round(cur * 1000)))))
-            else:
-                sld.setValue(int(max(-314, min(314, round(cur * 100)))))
-            sld.blockSignals(False)
-            n += 1
-        self._log(f"滑块目标已同步到实测位置（{n} 个关节）")
-
     # ── 日志 ─────────────────────────────────────────
     def _append_log(self, text: str) -> None:
         stamp = time.strftime("%H:%M:%S")
@@ -2233,13 +2651,23 @@ class StudioWindow(QMainWindow):
 
     # ── 关闭 ─────────────────────────────────────────
     def closeEvent(self, ev) -> None:  # noqa: N802
+        if self._conn_state == "connecting" or self._power_motion_pending or self._estopping:
+            ev.ignore()
+            return
+        if self._has_enabled_arms():
+            ev.ignore()
+            self._after_disable = "close"
+            self._on_enable_toggle()
+            return
+        if self.arms:
+            self._disconnect()
+            if self.arms:
+                ev.ignore()
+                return
         self._status_timer.stop()
         self._play_timer.stop()
         if self._recording:
             self._stop_record()             # 关窗口前把录制的帧落盘
-        for arm in self.arms.values():
-            arm.disconnect()
-        self.arms.clear()
         if self._worker is not None:
             self._worker.stop()
             self._worker.join(timeout=3.0)

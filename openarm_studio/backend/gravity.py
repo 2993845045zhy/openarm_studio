@@ -5,7 +5,7 @@
 1. **MuJoCo（首选）**：官方 `enactic/openarm_mujoco` 仓库的 `v1/openarm_bimanual.xml`
    （真机为 v1.0；PyPI 的 openarm-mujoco 只打包了 v2）。用 `mj_forward` 后
    的 `qfrc_bias`（重力+科氏偏置力）取前 7 个臂关节。
-   实测：本仓库 openarm_description 的 xacro 展开 URDF 与官方 v1 模型
+   实测：随附的双臂 URDF 与官方 v1 模型
    在连杆质量和关节轴上都不同（差异最高 243%），校准后的官方模型才可信。
 
 2. **KDL（回退）**：enactic/openarm_teleop 的算法（URDF→KDL→ChainDynParam），
@@ -14,20 +14,10 @@
 
 from __future__ import annotations
 
-import re
-import sys
 import threading
 from pathlib import Path
 
 import numpy as np
-
-try:                                    # 系统 PyKDL（与 ROS 2 Jazzy 同源）
-    import PyKDL
-except ImportError:                     # noqa: TRY003
-    sys.path.append("/usr/lib/python3/dist-packages")
-    import PyKDL
-
-from urdf_parser_py.urdf import URDF
 
 GRAVITY = (0.0, 0.0, -9.81)
 _BASE_LINK = "openarm_body_link0"
@@ -47,19 +37,7 @@ _FRIC_FV = np.array([0.063, 0.063, 0.604, 0.813, 0.029, 0.072, 0.084])
 _FRIC_FO = np.array([0.088, 0.088, 0.008, -0.058, 0.005, 0.009, -0.059])
 
 
-def _clean_urdf_text(text: str) -> str:
-    """去掉 XML 注释与 xacro 未展开的 ${...} 元素。
-
-    openarm_description 的 URDF 里 joint8（夹爪）被注释掉，展开后会残留
-    `${prefix}joint8` 这样的非法名字和半截注释。
-    """
-    text = re.sub(r"<!--.*?-->", "", text, flags=re.S)
-    text = re.sub(r'<joint name="\$\{[^"]+".*?</joint>', "", text, flags=re.S)
-    text = re.sub(r'<link name="\$\{[^"]+".*?</link>', "", text, flags=re.S)
-    return text
-
-
-def _build_chain(robot: URDF, root: str, tip: str):
+def _build_chain(robot, root: str, tip: str, kdl):
     """URDF 树 → KDL Chain（等价 kdl_parser 的 getChain）。"""
     by_child = {j.child: j for j in robot.joints}
     by_name = {ln.name: ln for ln in robot.links}
@@ -71,32 +49,32 @@ def _build_chain(robot: URDF, root: str, tip: str):
         path.append(j)
         cur = j.parent
 
-    chain = PyKDL.Chain()
+    chain = kdl.Chain()
     names: list[str] = []
     for j in reversed(path):
         rpy, xyz = j.origin.rpy, j.origin.xyz
         if j.type in ("revolute", "continuous"):
             axis = j.axis if j.axis is not None else [0.0, 0.0, 1.0]
-            jnt = PyKDL.Joint(j.name, PyKDL.Vector(0, 0, 0),
-                              PyKDL.Vector(*axis), PyKDL.Joint.RotAxis)
+            jnt = kdl.Joint(j.name, kdl.Vector(0, 0, 0),
+                              kdl.Vector(*axis), kdl.Joint.RotAxis)
             names.append(j.name)
         else:
-            jnt = PyKDL.Joint(j.name, PyKDL.Joint.Fixed)
+            jnt = kdl.Joint(j.name, kdl.Joint.Fixed)
         link = by_name.get(j.child)
         inr = link.inertial if link is not None else None
         if inr is None:
-            rb = PyKDL.RigidBodyInertia(0.0)
+            rb = kdl.RigidBodyInertia(0.0)
         else:
             i = inr.inertia
-            rb = PyKDL.RigidBodyInertia(
+            rb = kdl.RigidBodyInertia(
                 float(inr.mass),
-                PyKDL.Vector(*inr.origin.xyz),
-                PyKDL.RotationalInertia(i.ixx, i.iyy, i.izz,
+                kdl.Vector(*inr.origin.xyz),
+                kdl.RotationalInertia(i.ixx, i.iyy, i.izz,
                                         i.ixy, i.ixz, i.iyz),
             )
-        chain.addSegment(PyKDL.Segment(
+        chain.addSegment(kdl.Segment(
             j.child, jnt,
-            PyKDL.Frame(PyKDL.Rotation.RPY(*rpy), PyKDL.Vector(*xyz)),
+            kdl.Frame(kdl.Rotation.RPY(*rpy), kdl.Vector(*xyz)),
             rb,
         ))
     return chain, names
@@ -123,7 +101,7 @@ class GravityModel:
                 cls._instance = cls()
             return cls._instance
 
-    def __init__(self, cache_dir: Path | None = None):
+    def __init__(self):
         self.backend = ""
         self._mj = None
         self._mj_data = None
@@ -131,10 +109,10 @@ class GravityModel:
         self._mj_dofadr: dict[str, int] = {}
         self._mj_body: dict[str, int] = {}
         self._order: dict[str, list[str]] = {}
-        self._chains: dict[str, PyKDL.Chain] = {}
-        self._solvers: dict[str, PyKDL.ChainDynParam] = {}
-        self._jac_solvers: dict[str, PyKDL.ChainJntToJacSolver] = {}
-        self._fk_solvers: dict[str, PyKDL.ChainFkSolverPos_recursive] = {}
+        self._chains = {}
+        self._solvers = {}
+        self._jac_solvers = {}
+        self._fk_solvers = {}
 
         for cand in self.MUJOCO_CANDIDATES:
             if cand.exists():
@@ -144,7 +122,7 @@ class GravityModel:
                     return
                 except Exception:  # noqa: BLE001
                     pass
-        self._init_kdl(cache_dir)
+        self._init_kdl()
         self.backend = "kdl-urdf"
 
     # ── MuJoCo 后端（官方 v1 模型）──────────────────────
@@ -172,19 +150,22 @@ class GravityModel:
             self._mj_body[side] = body
 
     # ── KDL 后端（URDF 回退）───────────────────────────
-    def _init_kdl(self, cache_dir: Path | None) -> None:
-        from ..model.urdf2mjcf import generate_urdf
+    def _init_kdl(self) -> None:
+        try:
+            import PyKDL
+        except ImportError:
+            import sys
 
-        cache = cache_dir or (Path.home() / ".cache/openarm_studio")
-        cache.mkdir(parents=True, exist_ok=True)
-        urdf_path = cache / "gravity.urdf"
-        generate_urdf(urdf_path, bimanual=True)
-        clean = cache / "gravity_clean.urdf"
-        clean.write_text(_clean_urdf_text(urdf_path.read_text()))
+            sys.path.append("/usr/lib/python3/dist-packages")
+            import PyKDL
+        from urdf_parser_py.urdf import URDF
 
-        robot = URDF.from_xml_file(str(clean))
+        from ..model.urdf2mjcf import BIMANUAL_URDF
+
+        self._kdl = PyKDL
+        robot = URDF.from_xml_string(BIMANUAL_URDF.read_text())
         for side in ("left", "right"):
-            chain, names = _build_chain(robot, _BASE_LINK, f"openarm_{side}_hand")
+            chain, names = _build_chain(robot, _BASE_LINK, f"openarm_{side}_hand", PyKDL)
             if len(names) != _JOINTS_PER_ARM:
                 raise RuntimeError(f"{side} 臂关节数异常：{len(names)}")
             self._order[side] = names
@@ -209,13 +190,13 @@ class GravityModel:
                 d.qvel[:] = 0.0
                 mujoco.mj_forward(self._mj, d)
                 return np.array([
-                    d.qfrc_bias[self._mj_qadr[self._order[side][i]]]
+                    d.qfrc_bias[self._mj_dofadr[self._order[side][i]]]
                     for i in range(n)], dtype=float)
         solver = self._solvers[side]
-        jq = PyKDL.JntArray(n)
+        jq = self._kdl.JntArray(n)
         for i in range(n):
             jq[i] = float(q[i])
-        out = PyKDL.JntArray(n)
+        out = self._kdl.JntArray(n)
         solver.JntToGravity(jq, out)
         return np.array([out[i] for i in range(n)], dtype=float)
 
@@ -267,10 +248,10 @@ class GravityModel:
                 cols = [self._mj_dofadr[n] for n in self._order[side]]
                 return np.array(jacp[:, cols], dtype=float)
         solver = self._jac_solvers[side]
-        jq = PyKDL.JntArray(7)
+        jq = self._kdl.JntArray(7)
         for i in range(7):
             jq[i] = float(q[i])
-        jac = PyKDL.Jacobian(7)
+        jac = self._kdl.Jacobian(7)
         solver.JntToJac(jq, jac)
         return np.array([[jac[row, col] for col in range(7)]
                          for row in range(3)], dtype=float)
@@ -283,9 +264,9 @@ class GravityModel:
                 return np.array(self._mj_data.xpos[self._mj_body[side]],
                                 dtype=float).copy()
         solver = self._fk_solvers[side]
-        jq = PyKDL.JntArray(7)
+        jq = self._kdl.JntArray(7)
         for i in range(7):
             jq[i] = float(q[i])
-        frame = PyKDL.Frame()
+        frame = self._kdl.Frame()
         solver.JntToCart(jq, frame)
         return np.array([frame.p.x(), frame.p.y(), frame.p.z()], dtype=float)

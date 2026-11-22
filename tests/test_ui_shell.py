@@ -23,6 +23,7 @@ from PySide6.QtCore import QPoint, Qt
 from PySide6.QtWidgets import QApplication, QPushButton
 from PySide6.QtTest import QTest
 
+from openarm_studio.backend.teleop import JointFeedback
 from openarm_studio.ui.shell import StudioWindow
 from openarm_studio.ui.switch import ModeSwitch
 
@@ -37,6 +38,9 @@ def app():
 def win(app):
     w = StudioWindow(theme_name="dark")
     yield w
+    w.arms.clear()
+    w._enabling = w._disabling = w._estopping = False
+    w._conn_state = "disconnected"
     w.close()
     QTest.qWait(50)
 
@@ -139,7 +143,7 @@ def test_bus_probe_result_updates_rows(win):
     assert win.row_bus_r.val.text() == "在线 7/7"
     assert win.row_bus_l.val.text() == "❌ 0/7 无应答"
     log = win.log_view.toPlainText()
-    assert "右臂(can0)" in log and "0/7 应答" in log
+    assert "右臂(can0)" in log and "0/7 轴有状态回包" in log
     assert not win._probing and win.btn_bus_check.isEnabled()
 
     win._on_bus_result({
@@ -150,6 +154,13 @@ def test_bus_probe_result_updates_rows(win):
     assert win.row_bus_r.val.text() == "⚠️ 5/7 部分在线"
     assert "失联轴 ['J6', 'J7']" in win.log_view.toPlainText()
     assert "打不开" in win.row_bus_l.val.text()
+
+
+def test_bus_probe_distinguishes_full_send_queue_and_missing_replies(win):
+    win._on_bus_result({"can0": {"alive": 0}, "can1": {"alive": 0, "tx_queue_full": 35}})
+    assert win.row_bus_r.val.text() == "❌ 0/7 无应答"
+    assert win.row_bus_l.val.text() == "发送队列满 · 0/7 回包"
+    assert "左臂(can1)：发送队列满 35 次" in win.log_view.toPlainText()
 
 
 class _FakeArm:
@@ -251,12 +262,32 @@ class _CtrlArm:
     """只记录力控调用序列的假臂。"""
     connected = True
     enabled = True
+    impedance_gains = None
     rate = 0.0
     safety_stop_reason = None
     health = (["OK"] * 8, {})
 
     def __init__(self):
         self.calls = []
+        self.feedback = None
+        self.teleop_command = None
+
+    def joint_feedback(self, *, require_enabled=True):
+        return self.feedback
+
+    def set_teleop(self, command):
+        self.teleop_command = command
+
+    supports_gripper_control = True
+    grasp_status = "idle"
+
+    def set_gripper_force(self, percent):
+        self.calls.append(("gripper_force", percent))
+
+    def request_grasp(self):
+        self.calls.append(("grasp",))
+        self.grasp_status = "pending"
+        return True
 
     def positions(self):
         return {}
@@ -274,24 +305,239 @@ class _CtrlArm:
         return 0
 
     def disconnect(self):
-        pass
+        self.connected = False
 
-    def set_gravity_comp(self, on, scale=1.0, kp_floor=30.0):
-        self.calls.append(("grav", bool(on)))
+    def set_control_mode(self, mode, *, stiffness=0.35, zeta=1.0):
+        self.calls.append(("mode", mode, round(stiffness, 3), round(zeta, 3)))
 
-    def set_joint_impedance(self, on, stiffness=0.35, zeta=1.0):
-        self.calls.append(("jimp", bool(on), round(float(stiffness), 3),
-                           round(float(zeta), 3)))
+    def estop(self):
+        self.calls.append(("estop",))
+        self.enabled = False
 
     def set_friction_comp(self, on):
         self.calls.append(("fric", bool(on)))
+
+    def set_targets(self, targets, *, manual=True, slider=False):
+        self.calls.append(("targets", targets, manual, slider))
+
+    def enable(self, done=None):
+        self.calls.append(("enable",))
+        self.enable_done = done
+        return True
+
+    def disable(self, done=None):
+        self.calls.append(("disable",))
+        self.disable_done = done
+        return True
+
+    def move_start(self, done=None):
+        self.calls.append(("goto_start",))
+        return True
+
+    def move_park(self, done=None):
+        self.calls.append(("goto_stop",))
+        return True
+
+
+@pytest.mark.parametrize("leader_side", ["left", "right"])
+@pytest.mark.parametrize("lose_feedback", [True, False])
+def test_teleop_uses_measured_offsets_and_stops_on_timeout(win, leader_side, lose_feedback):
+    win.arms.update(left=_CtrlArm(), right=_CtrlArm())
+    win._conn_state = "connected"
+    win.combo_teleop.setCurrentIndex(0 if leader_side == "left" else 1)
+    follower_side = "right" if leader_side == "left" else "left"
+    leader, follower = win.arms[leader_side], win.arms[follower_side]
+    deadline = time.monotonic() + 1
+    leader.feedback = JointFeedback((0.2,) * 7, (0.0,) * 7, deadline)
+    follower.feedback = JointFeedback((-0.3,) * 7, (0.0,) * 7, deadline)
+
+    QTest.mouseClick(win.btn_teleop, Qt.LeftButton)
+    assert leader.teleop_command.role == "leader"
+    assert follower.teleop_command.role == "follower"
+    assert follower.teleop_command.joints == (-0.3,) * 7
+    assert not win.combo_teleop.isEnabled() and not win.btn_zero.isEnabled()
+
+    leader.feedback = JointFeedback((0.3,) * 7, (0.1,) * 7, deadline)
+    win._send_live_targets()
+    assert follower.teleop_command.joints == pytest.approx((-0.4, -0.4, -0.4, -0.2, -0.4, -0.4, -0.4))
+
+    if lose_feedback:
+        leader.feedback = None
+        reason = ("左臂" if leader_side == "left" else "右臂") + "关节反馈超时"
+    else:
+        reason = "协同指令超时"
+        leader.teleop_command.watchdog.stop(reason)
+    win._send_live_targets()
+    assert reason in win.lbl_teleop.text()
+    assert leader.teleop_command is None and follower.teleop_command is None
+    assert win.sw_gravity.isChecked()
+    assert win.combo_teleop.isEnabled() and win.btn_zero.isEnabled()
+    assert win.btn_teleop.text() == "开始跟随"
+
+
+@pytest.mark.parametrize("mirror", [True, False])
+def test_teleop_refreshes_old_command_when_both_new_samples_are_fresh(win, monkeypatch, mirror):
+    clock = [1.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    win._conn_state = "connected"
+    win.arms.update(left=_CtrlArm(), right=_CtrlArm())
+    win.sw_teleop_mirror.setChecked(mirror)
+    for arm in win.arms.values():
+        arm.feedback = JointFeedback((0.0,) * 7, (0.0,) * 7, 1.1)
+    win._toggle_teleop()
+    assert win._teleop_session is not None
+
+    clock[0] = 1.12
+    for arm in win.arms.values():
+        arm.feedback = JointFeedback((0.1,) * 7, (0.0,) * 7, 1.25)
+    win._send_live_targets()
+    assert win._teleop_session is not None
+    assert all(arm.teleop_command.expires_at == 1.25 for arm in win.arms.values())
+
+
+@pytest.mark.parametrize("leader_side", ["left", "right"])
+def test_teleop_without_mirroring_uses_physical_joint_directions(win, leader_side):
+    win.arms.update(left=_CtrlArm(), right=_CtrlArm())
+    win._conn_state = "connected"
+    win.combo_teleop.setCurrentIndex(0 if leader_side == "left" else 1)
+    follower_side = "right" if leader_side == "left" else "left"
+    leader, follower = win.arms[leader_side], win.arms[follower_side]
+    deadline = time.monotonic() + 1.0
+    leader.feedback = JointFeedback((0.2,) * 7, (0.0,) * 7, deadline)
+    follower.feedback = JointFeedback((-0.3,) * 7, (0.0,) * 7, deadline)
+    assert win.sw_teleop_mirror.isChecked()
+    QTest.mouseClick(win.sw_teleop_mirror, Qt.LeftButton)
+    QTest.mouseClick(win.btn_teleop, Qt.LeftButton)
+    assert not win.sw_teleop_mirror.isEnabled()
+    leader.feedback = JointFeedback((0.3,) * 7, (0.1,) * 7, deadline)
+    win._send_live_targets()
+    assert follower.teleop_command.joints == pytest.approx((-0.4, -0.2, -0.2, -0.2, -0.2, -0.2, -0.4))
+    assert "同向跟随" in win.lbl_teleop.text()
+    QTest.mouseClick(win.btn_teleop, Qt.LeftButton)
+    assert win.sw_teleop_mirror.isEnabled()
+
+
+def test_grip_force_smart_grasp_and_release_are_available_in_teach_mode(win):
+    win.arms["left"] = arm = _CtrlArm()
+    win._conn_state = "connected"
+    name = "openarm_left_finger_joint1"
+    win.sw_teach.setChecked(True)
+    assert win._gripper_controls.isEnabled()
+    assert not hasattr(win, "sw_gripper_teach")
+    limit, grasp, release, status = win._grip_options["left"]
+    limit.setValue(45)
+    win._on_slider(name, 12)
+    assert arm.calls[-2:] == [
+        ("gripper_force", 45), ("targets", {name: 0.012}, True, False),
+    ]
+    QTest.mouseClick(grasp, Qt.LeftButton)
+    assert arm.calls[-1] == ("grasp",)
+    assert name not in win._cmd_pose and not grasp.isEnabled()
+
+    arm.grasp_status = "holding"
+    arm.grasp_torque_limit = 1.28
+    win._refresh_teleop_controls()
+    assert status.text() == "已夹持 · 保持中（电流上限 1.28 N·m）"
+    QTest.mouseClick(release, Qt.LeftButton)
+    assert arm.calls[-1] == ("targets", {name: 0.044}, True, False)
+
+
+def test_teleop_requires_two_stationary_arms_with_feedback(win):
+    win._conn_state = "connected"
+    win.arms["left"] = left = _CtrlArm()
+    deadline = time.monotonic() + 1
+    left.feedback = JointFeedback((0.0,) * 7, (0.0,) * 7, deadline)
+    win._toggle_teleop()
+    assert win._teleop_session is None
+    win.arms["right"] = right = _CtrlArm()
+    right.feedback = JointFeedback((0.0,) * 7, (0.4,) * 7, deadline)
+    win._toggle_teleop()
+    assert win._teleop_session is None
+
+
+@pytest.mark.parametrize("ok", [True, False])
+def test_enable_keeps_default_gravity_when_arms_are_enabled(win, ok):
+    win.arms.update(left=_CtrlArm(), right=_CtrlArm())
+    for arm in win.arms.values():
+        arm.enabled = False
+    win._on_enable_toggle()
+    assert win.sw_gravity.isChecked() and not win.sw_gravity.isEnabled()
+    assert win.btn_enable.text() == "使能走位中…"
+    assert all(arm.calls == [("targets", None, True, False), ("enable",)] for arm in win.arms.values())
+    left, right = win.arms["left"], win.arms["right"]
+    left.enabled = ok
+    left.enable_done(ok)
+    assert not win.btn_enable.isEnabled()
+    right.enabled = ok
+    right.enable_done(ok)
+    assert win.sw_gravity.isChecked() is ok
+    assert win.sw_gravity.isEnabled() and win.btn_enable.isEnabled()
+    assert win.btn_enable.text() == ("失能" if ok else "使能")
+
+
+def test_partial_enable_retry_targets_only_disabled_arm(win):
+    win._conn_state = "connected"
+    win.arms.update(left=_CtrlArm(), right=_CtrlArm())
+    left, right = win.arms["left"], win.arms["right"]
+    left.enabled = right.enabled = False
+    win.sw_jimp.setChecked(True)
+    win._on_enable_toggle()
+    left.enabled = True
+    left.enable_done(True)
+    right.enable_done(False)
+
+    assert "右臂未使能" in win.log_view.toPlainText()
+    assert not win.btn_retry_enable.isHidden()
+    assert win.btn_enable.text() == "失能" and win.btn_enable.isEnabled()
+    left.calls.clear()
+    right.calls.clear()
+
+    QTest.mouseClick(win.btn_retry_enable, Qt.LeftButton)
+    assert win.btn_retry_enable.isHidden()
+    assert left.calls == [("targets", None, True, False)]
+    assert right.calls == [("targets", None, True, False), ("mode", "impedance", 0.35, 1.0), ("enable",)]
+    right.enabled = True
+    right.enable_done(True)
+    assert win.btn_retry_enable.isHidden()
+    assert win.btn_enable.text() == "失能" and win.sw_jimp.isChecked()
+
+
+def test_disable_waits_for_both_arms_before_clearing_compensation(win):
+    win.arms.update(left=_CtrlArm(), right=_CtrlArm())
+    win.sw_gravity.setChecked(True)
+    win._on_enable_toggle()
+    assert win.sw_gravity.isChecked() and not win.sw_gravity.isEnabled()
+    assert not win.btn_enable.isEnabled()
+    assert win.btn_enable.text() == "失能回程中…"
+    assert all(arm.calls[-1] == ("disable",) and arm.calls[1][1] == "gravity"
+               for arm in win.arms.values())
+
+    left, right = win.arms["left"], win.arms["right"]
+    left.enabled = False
+    left.disable_done(True)
+    assert win.sw_gravity.isChecked()
+
+    right.enabled = False
+    right.disable_done(True)
+    assert not win.sw_gravity.isChecked() and win.sw_gravity.isEnabled()
+    assert win.btn_enable.isEnabled() and win.btn_enable.text() == "使能"
+    assert all(("mode", "position", 0.35, 1.0) not in arm.calls for arm in win.arms.values())
+
+
+def test_unsettled_disable_keeps_gravity_on(win):
+    win.arms["right"] = arm = _CtrlArm()
+    win.sw_gravity.setChecked(True)
+    win._on_enable_toggle()
+    arm.disable_done(False)
+    assert win.sw_gravity.isChecked() and win.sw_gravity.isEnabled()
+    assert win.btn_enable.text() == "失能"
 
 
 def test_joint_impedance_requires_connection(win):
     """未连接时开关节阻抗要自动回弹到关，并写日志。"""
     win.sw_jimp.setChecked(True)
     assert not win.sw_jimp.isChecked()
-    assert "关节阻抗" in win.log_view.toPlainText()
+    assert "需要连接真机" in win.log_view.toPlainText()
 
 
 def test_joint_impedance_mutual_exclusion(win):
@@ -301,11 +547,11 @@ def test_joint_impedance_mutual_exclusion(win):
     win.sw_gravity.setChecked(True)
     win.sw_jimp.setChecked(True)
     assert win.sw_jimp.isChecked() and not win.sw_gravity.isChecked()
-    assert ("jimp", True, 0.35, 1.0) in arm.calls
+    assert ("mode", "impedance", 0.35, 1.0) in arm.calls
 
     win.sw_gravity.setChecked(True)
     assert win.sw_gravity.isChecked() and not win.sw_jimp.isChecked()
-    assert ("jimp", False, 0.35, 1.0) in arm.calls
+    assert [call[1] for call in arm.calls if call[0] == "mode"] == ["gravity", "impedance", "gravity"]
     del win.arms["right"]
 
 
@@ -314,15 +560,104 @@ def test_joint_impedance_sliders_apply_live(win):
     arm = _CtrlArm()
     win.arms["right"] = arm
     win.sw_jimp.setChecked(True)
-    assert not win.sld_stiff.isEnabled()
-    win.sld_stiff.setValue(10)               # 10%
-    win.sld_zeta.setValue(60)                # 0.60
-    assert ("jimp", True, 0.10, 0.60) in arm.calls
-    assert win.lbl_stiff.text() == "10%"
-    assert win.lbl_zeta.text() == "0.60"
-    win.sw_jimp.setChecked(False)
     assert win.sld_stiff.isEnabled() and win.sld_zeta.isEnabled()
+    QTest.keyClick(win.sld_stiff, Qt.Key_Left)
+    QTest.keyClick(win.sld_zeta, Qt.Key_Left)
+    assert ("mode", "impedance", 0.34, 0.99) in arm.calls
+    assert win.lbl_stiff.text() == "34%"
+    assert win.lbl_zeta.text() == "0.99"
+    win.sw_jimp.setChecked(False)
+    assert not win.sld_stiff.isEnabled() and not win.sld_zeta.isEnabled()
+    QTest.keyClick(win.sld_stiff, Qt.Key_Left)
+    assert win.sld_stiff.value() == 34
     del win.arms["right"]
+
+
+def test_joint_impedance_status_tracks_active_arm_and_dispatch(win):
+    win.arms["right"] = arm = _CtrlArm()
+    arm.enabled = False
+    win.combo_arm.setCurrentIndex(1)
+    win.sw_jimp.setChecked(True)
+    assert "右臂待使能" in win.lbl_gain.text()
+
+    arm.enabled = True
+    win._refresh_impedance_status()
+    assert "尚无近期阻抗帧" in win.lbl_gain.text()
+
+    arm.impedance_gains = ((24.5,) * 7, (3.25,) * 7)
+    win._refresh_impedance_status()
+    assert "右臂 Kp 24.5" in win.lbl_gain.text()
+    assert "Kd 3.25" in win.lbl_gain.text()
+
+    win.arms.clear()
+    win.sw_mode.setCurrentIndex(1)
+    assert "仿真使用固定伺服增益" in win.lbl_gain.text()
+    assert not win.sld_stiff.isEnabled()
+
+
+@pytest.mark.parametrize(("kind", "switch_name"), [
+    ("goto_start", "sw_gravity"),
+    ("goto_stop", "sw_jimp"),
+])
+def test_move_pose_keeps_compensation(win, kind, switch_name):
+    switch = getattr(win, switch_name)
+    win.arms["right"] = arm = _CtrlArm()
+    switch.setChecked(True)
+    calls = len(arm.calls)
+    win._on_move_pose(kind)
+    assert switch.isChecked()
+    assert arm.calls[calls:] == [("targets", None, True, False), (kind,)]
+    assert win._traveling
+
+
+def test_zero_pose_keeps_gravity_when_enabled(win):
+    win.arms["right"] = arm = _CtrlArm()
+    win._conn_state = "connected"
+    win.sw_gravity.setChecked(True)
+    win._zero_pose()
+    assert win.sw_gravity.isChecked()
+    assert [call[1] for call in arm.calls if call[0] == "mode"] == ["gravity"]
+    assert win._cmd_pose["openarm_right_joint1"] == 0.0
+
+
+def test_slider_dispatches_only_to_the_affected_arm(win):
+    win.arms.update(left=_CtrlArm(), right=_CtrlArm())
+    win._conn_state = "connected"
+    win._on_slider("openarm_right_joint7", 90)
+    assert win.arms["left"].calls == []
+    target = ("targets", {"openarm_right_joint7": 0.9}, True, True)
+    assert win.arms["right"].calls == [target]
+
+    win._send_live_targets()
+    assert win.arms["left"].calls == []
+    assert win.arms["right"].calls[-1] == target
+
+
+def test_preset_resumes_targets_only_after_both_arms_finish(win):
+    win.arms.update(left=_CtrlArm(), right=_CtrlArm())
+    win._on_move_pose("goto_start")
+    win._on_arm_travel_done(win._travel_id, "left", True)
+    assert win._traveling
+    win._on_arm_travel_done(win._travel_id, "right", True)
+    assert not win._traveling
+    assert "轨迹完成" in win.log_view.toPlainText()
+
+
+def test_after_travel_is_idempotent(win):
+    """travel_sig 与兜底定时器都会触发；第二次必须是无操作，
+    否则轨迹结束姿态会被后到的回调再覆盖一次。"""
+    win._traveling = True
+    win._after_travel(True)
+    assert not win._traveling
+    # 第二次（兜底定时器迟到）：不抛错、不改状态
+    win._after_travel(False)
+    assert not win._traveling
+
+
+def test_move_pose_without_arms_logs_only(win):
+    win._on_move_pose("goto_stop")
+    assert not win._traveling
+    assert "未连接" in win.log_view.toPlainText()
 
 
 # ── 示教录制 / 回放 ────────────────────────────────────────
@@ -346,16 +681,28 @@ def test_record_requires_connection(win):
 def test_record_toggle_and_save(win, tmp_path, monkeypatch):
     """开始→采样→停止：写 CSV 并把文件列表刷新出来。"""
     monkeypatch.setattr(win, "_teach_dir", lambda: tmp_path)
-    win.arms["right"] = _CtrlArm()             # 只需 connected 判定
+    win.arms["right"] = right = _CtrlArm()
+    feedback = JointFeedback((0.1,) * 7, (0.0,) * 7, time.monotonic() + 1)
+    right.feedback = feedback
+    win._start_record()
+    assert not win._recording
+    win.arms["left"] = left = _CtrlArm()
+    left.feedback = feedback
+    for side, arm in win.arms.items():
+        pose = {f"openarm_{side}_joint{i}": 0.1 for i in range(1, 8)}
+        pose[f"openarm_{side}_finger_joint1"] = 0.02
+        monkeypatch.setattr(arm, "positions", lambda pose=pose: pose)
     win._start_record()
     assert win._recording and win.btn_record.text() == "停止并保存"
-    win._rec_traj = [_teach_row(0.0, 0.1) + [0.02, 0.03]]
-    win._stop_record()
+    win._push_pose()
+    right.feedback = None
+    win._push_pose()
     assert not win._recording and win.btn_record.text() == "开始录制"
     files = list(tmp_path.glob("teach_*.csv"))
     assert len(files) == 1
-    assert len(win._load_teach_csv(files[0])[0]) == 17
-    del win.arms["right"]
+    rows = win._load_teach_csv(files[0])
+    assert len(rows) == 1
+    assert rows[0][1:] == [0.1] * 14 + [0.02, 0.02]
 
 
 def test_teach_toggle_no_longer_records(win):
@@ -399,6 +746,78 @@ def test_teach_csv_parses_old_and_new_format(win, tmp_path):
     new.write_text("t\n" + _line(_teach_row(0.0, 0.1) + [0.03, 0.04]) + "\n")
     rows = win._load_teach_csv(new)
     assert len(rows) == 1 and len(rows[0]) == 17
+
+
+def test_zero_cancels_local_playback(win):
+    win._play_rows = [_teach_row(0.0, 0.1), _teach_row(1.0, 0.5)]
+    win._play_timer.start()
+    win._apply_teach_frame(win._play_rows[0])
+    win._zero_pose()
+    assert not win._play_timer.isActive()
+    assert win._local_pose["openarm_left_joint1"] == 0.0
+
+
+def test_manual_takeover_cancels_playback_targets_and_holds_other_joints(win):
+    win._conn_state = "connected"
+    win.arms["right"] = arm = _CtrlArm()
+    win._play_live_sides = {"right"}
+    win._play_rows = [_teach_row(0.0, 0.1), _teach_row(1.0, 0.5)]
+    win._play_timer.start()
+    win._cmd_pose = {"openarm_right_joint2": 0.7, "openarm_right_finger_joint1": 0.01}
+    win._on_slider("openarm_right_joint1", 25)
+    assert not win._play_timer.isActive()
+    assert arm.calls == [
+        ("targets", None, True, False),
+        ("targets", {"openarm_right_joint1": 0.25}, True, True),
+    ]
+
+
+def test_playback_fault_stops_both_arms_instead_of_continuing_on_one(win):
+    win.arms.update(left=_CtrlArm(), right=_CtrlArm())
+    win._conn_state = "connected"
+    deadline = time.monotonic() + 1
+    win.arms["right"].feedback = JointFeedback((0.0,) * 7, (0.0,) * 7, deadline)
+    win._play_live_sides = {"left", "right"}
+    win._play_last_tick = time.monotonic()
+    win._play_timer.start()
+    win._cmd_pose = {"openarm_right_joint1": 1.0}
+    win._send_live_targets()
+    assert not win._play_timer.isActive() and not win._cmd_pose
+    assert all(arm.calls == [("targets", None, True, False)] for arm in win.arms.values())
+
+
+def test_connected_hardware_cannot_be_hidden_by_simulation(win):
+    win.arms["right"] = _CtrlArm()
+    win._conn_state = "connected"
+    win.sw_mode.setCurrentIndex(1)
+    assert not win._is_sim
+    assert "先断开真机" in win.log_view.toPlainText()
+
+
+def test_disconnect_waits_for_confirmed_disable(win):
+    win.arms["right"] = arm = _CtrlArm()
+    win._conn_state = "connected"
+    win._disconnect()
+    assert win._connected and win._disabling and arm.calls[-1] == ("disable",)
+    arm.enabled = False
+    arm.disable_done(True)
+    QTest.qWait(1)
+    assert not win.arms and not win._connected
+
+
+def test_estop_clears_playback_modes_and_pending_callbacks(win):
+    win.arms["right"] = arm = _CtrlArm()
+    win._conn_state = "connected"
+    win.sw_gravity.setChecked(True)
+    win._play_live_sides = {"right"}
+    win._play_timer.start()
+    win._cmd_pose = {"openarm_right_joint1": 0.9}
+    win._traveling = True
+    win._travel_arms.add("right")
+    win._on_estop()
+    assert arm.calls[-1] == ("estop",)
+    assert not win._traveling and not win._play_timer.isActive() and not win._cmd_pose
+    assert not win.sw_gravity.isChecked()
 
 
 def test_apply_teach_frame_maps_joints_and_gripper(win):
